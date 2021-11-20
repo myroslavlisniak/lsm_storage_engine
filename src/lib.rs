@@ -138,6 +138,7 @@ impl Storage {
 
     pub fn insert(&mut self, key: &ByteStr, value: &ByteStr) -> Result<(), SegmentError> {
         let current_segment = &mut self.segments[self.current_index];
+        debug!("Inserting key: {:?} in segment: {}", key, self.current_index);
         let position = current_segment.insert(key, value)?;
         if position > FILE_SIZE_LIMIT {
             self.compact()?;

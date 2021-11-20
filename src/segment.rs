@@ -219,7 +219,6 @@ impl Segment {
                 .take(data_len as u64)
                 .read_to_end(&mut data)?;
         }
-        debug!("read data");
         debug_assert_eq!(data.len(), data_len as usize);
         let checksum = crc::crc32::checksum_ieee(&data);
         if checksum != saved_checksum {
