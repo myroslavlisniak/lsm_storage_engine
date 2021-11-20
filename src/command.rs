@@ -5,6 +5,12 @@ pub enum Command {
     Update(Vec<u8>, Vec<u8>),
     NotSupported,
 }
+pub enum Response {
+    Found(Vec<u8>),
+    Ok,
+    NotFound(Vec<u8>),
+    NotSupported
+}
 
 impl Command {
     pub fn parse(input: &str) -> Command {
