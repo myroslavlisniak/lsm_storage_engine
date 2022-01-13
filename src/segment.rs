@@ -1,15 +1,19 @@
-use std::fs::{File, OpenOptions};
 use std::collections::HashMap;
-use std::io::{BufReader, BufWriter, Error, Read, Seek, SeekFrom, Write};
-use std::path::Path;
-use std::io;
+use std::convert::TryFrom;
 use std::fmt;
 use std::fmt::Formatter;
+use std::fs::{File, OpenOptions};
+use std::io::{BufRead, BufReader, BufWriter, Error, Read, Seek, SeekFrom, Write};
+use std::io;
+use std::path::{Path, PathBuf};
+use std::str;
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use bincode::ErrorKind;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use crc::crc32;
-use serde_derive::{Deserialize, Serialize};
 use log::{debug, error, info, warn};
+use serde_derive::{Deserialize, Serialize};
 
 pub type ByteStr = [u8];
 pub type ByteString = Vec<u8>;
@@ -19,64 +23,155 @@ pub struct KeyValuePair {
     pub key: ByteString,
     pub value: ByteString,
 }
-#[derive(Debug)]
-pub struct SegmentError {
-    kind: String,
-    message: String
+
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SegmentHeader {
+    pub segment_id: u64,
+    creation_date: u128,
+    compacted: bool,
 }
 
 #[derive(Debug)]
 pub struct Segment {
+    pub header: SegmentHeader,
     file: File,
     index: HashMap<ByteString, u64>,
 }
 
 impl fmt::Display for SegmentError {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "An Error Occurred, Please Try Again!")
+        write!(f, "{}", self.message())
     }
 }
+
+impl fmt::Debug for SegmentError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.message())
+    }
+}
+
 impl From<io::Error> for SegmentError {
     fn from(e: Error) -> Self {
-        SegmentError{
-            kind: String::from("io"),
-            message: e.to_string()
+        Self::IoError(e.to_string())
+    }
+}
+
+
+impl From<Box<bincode::ErrorKind>> for SegmentError {
+    fn from(_: Box<ErrorKind>) -> Self {
+        SegmentError::CorruptedIndex
+    }
+}
+
+pub enum SegmentError {
+    IoError(String),
+    MissingHeader,
+    CorruptedIndex,
+}
+
+
+impl SegmentError {
+    fn message(&self) -> String {
+        match self {
+            Self::IoError(message) => format!("Io error occured. {} ", message),
+            Self::MissingHeader => format!("Header is missing"),
+            Self::CorruptedIndex => format!("Corrupted index found, skipping")
         }
     }
 }
 
-impl From<Box<bincode::ErrorKind>> for SegmentError {
-    fn from(e: Box<ErrorKind>) -> Self {
-        SegmentError{
-            kind: String::from("index"),
-            message: e.to_string()
+impl std::error::Error for SegmentError {}
+
+impl TryFrom<&Path> for Segment {
+    type Error = SegmentError;
+
+    fn try_from(path: &Path) -> Result<Self, Self::Error> {
+        let file = OpenOptions::new()
+            .read(true)
+            .open(path)?;
+        let mut reader = BufReader::new(&file);
+        let header = SegmentHeader::from_reader(&mut reader)?;
+        let parent_path = path.parent().unwrap();
+        let index_path = Segment::index_path(header.segment_id, parent_path);
+        let index = Segment::read_index(&index_path).unwrap_or(HashMap::new());
+
+        let mut segment = Segment {
+            header,
+            file,
+            index,
+        };
+        if segment.index.is_empty() {
+            segment.load()?;
         }
+        Ok(segment)
+    }
+}
+
+impl SegmentHeader {
+    fn from_reader<R: BufRead>(reader: &mut R) -> Result<SegmentHeader, SegmentError> {
+        let mut input = String::new();
+        reader.read_line(&mut input)?;
+        let result: SegmentHeader = serde_json::from_str(&input)
+            .or(Err(SegmentError::MissingHeader))?;
+        Ok(result)
+    }
+
+    fn to_writer<W: Write>(&self, writer: &mut W) -> Result<(), SegmentError> {
+        let mut string = serde_json::to_string(self).expect("Can't serialize header");
+        string.push_str("\n");
+        writer.write_all(string.as_bytes())?;
+        // writer.write_all("\n".as_bytes())?;
+        Ok(())
     }
 }
 
 impl Segment {
-    pub fn from_file(file: File) -> Segment {
-        Segment{
-            file,
-            index: HashMap::new()
-        }
-    }
+    pub fn new(id: u64, path: &Path) -> Result<Segment, SegmentError> {
+        let path_buf = Segment::data_path(id, false, path);
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .append(true)
+            .open(&path_buf)?;
 
-    pub fn from_file_with_index(file: File, index_path: &Path) -> Segment {
-        let mut segment = Segment {
-            file,
-            index: Segment::read_index(index_path).unwrap_or_else(|_| HashMap::new()),
+        let header = SegmentHeader {
+            segment_id: id,
+            compacted: false,
+            creation_date: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("Time went backwards")
+                .as_millis(),
         };
-        if segment.index.is_empty() {
-            segment.load().expect("Can't process data file. data file is corrupted");
-        }
-        segment
-
+        header.to_writer(&mut file)?;
+        Ok(Segment {
+            header,
+            file,
+            index: HashMap::new(),
+        })
     }
+    pub fn index_path(id: u64, base_path: &Path) -> PathBuf {
+        let mut path = base_path.to_path_buf();
+        path.push(format!("segment.{}.index", id));
+        path
+    }
+
+    pub fn data_path(id: u64, compacted: bool, base_path: &Path) -> PathBuf {
+        let mut path = base_path.to_path_buf();
+        let mut string = format!("segment.{}", id);
+        if compacted {
+            string.push_str(".compacted");
+        }
+        path.push(string);
+        path
+    }
+
 
     pub fn load(&mut self) -> io::Result<()> {
         let mut f = BufReader::new(&mut self.file);
-        f.seek(SeekFrom::Start(0));
+        f.seek(SeekFrom::Start(0))?;
+        f.read_line(&mut String::new())?;
         loop {
             let current_position = f.seek(SeekFrom::Current(0))?;
             let maybe_kv = Segment::process_record(&mut f);
@@ -104,7 +199,7 @@ impl Segment {
     pub fn get(&self, key: &ByteStr) -> io::Result<Option<ByteString>> {
         match self.index.get(key) {
             None => Ok(None),
-            Some(position) =>  {
+            Some(position) => {
                 let kv = self.get_at(*position)?;
                 if kv.value == [0] {
                     Ok(None)
@@ -116,17 +211,24 @@ impl Segment {
     }
 
 
-
-    pub fn compact(&mut self, path: &Path, index_path: &Path) -> Result<(), SegmentError> {
+    pub fn compact(&mut self, base_path: &Path) -> Result<(), SegmentError> {
         let mut f = BufReader::new(&mut self.file);
+        let data_path = Segment::data_path(self.header.segment_id, true, base_path);
+        let index_path = Segment::index_path(self.header.segment_id, base_path);
         let mut new_file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .append(true)
-            .open(path)?;
+            .open(data_path)?;
+        let header = SegmentHeader {
+            segment_id: self.header.segment_id,
+            creation_date: self.header.creation_date,
+            compacted: true,
+        };
+        header.to_writer(&mut new_file)?;
         f.seek(SeekFrom::Start(0))?;
-
+        f.read_line(&mut String::new())?;
         loop {
             let current_position = f.seek(SeekFrom::Current(0))?;
             let maybe_kv = Segment::process_record(&mut f);
@@ -153,10 +255,10 @@ impl Segment {
                 }
             }
         }
-        self.change_segment_file(new_file);
+        self.file = new_file;
         self.index.clear();
         self.load()?;
-        self.save_index(index_path)?;
+        self.save_index(&index_path)?;
         Ok(())
     }
 
@@ -182,9 +284,6 @@ impl Segment {
         f.write_all(&bytes).map_err(&SegmentError::from)
     }
 
-    fn change_segment_file(&mut self, new_file: File) {
-        self.file = new_file;
-    }
 
     fn insert_but_ignore_index(key: &ByteStr, value: &ByteStr, file: &mut File) -> io::Result<u64> {
         let mut f = BufWriter::new(file);
@@ -237,47 +336,40 @@ impl Segment {
         f.seek(SeekFrom::Start(position)).unwrap();
         Segment::process_record(&mut f)
     }
-
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
     use std::env::temp_dir;
+    use std::fs;
     use std::fs::File;
     use std::fs::OpenOptions;
-    use std::fs;
+
     use crate::segment::Segment;
+    use crate::segment::SegmentHeader;
 
     #[test]
     fn segment_compact() {
         let mut dir = temp_dir();
 
-        let name = "seg.0";
-        dir.push(name);
-        fs::remove_file(&dir);
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .append(true)
-            .open(&dir).unwrap();
-        let mut segment = Segment{
-            file,
-            index: HashMap::new()
+        let file = Segment::data_path(1, false, &dir);
+        fs::remove_file(&file);
+        let header = SegmentHeader {
+            segment_id: 1,
+            creation_date: 10000000,
+            compacted: false,
         };
-        segment.insert( &String::from("key").into_bytes(), &String::from("value").into_bytes());
-        segment.insert( &String::from("key").into_bytes(), &String::from("value").into_bytes());
-        segment.insert( &String::from("key").into_bytes(), &String::from("value").into_bytes());
-        segment.insert( &String::from("key").into_bytes(), &String::from("value").into_bytes());
-        let mut dir = temp_dir();
-        let mut compacted_path = dir.clone();
-        compacted_path.push("seg.0.compacted");
-        let mut index_path = dir.clone();
-        index_path.push("seg.0.index");
+        let mut segment = Segment::new(1, &dir).unwrap();
+        segment.insert(&String::from("key").into_bytes(), &String::from("value").into_bytes());
+        segment.insert(&String::from("key").into_bytes(), &String::from("value").into_bytes());
+        segment.insert(&String::from("key").into_bytes(), &String::from("value").into_bytes());
+        segment.insert(&String::from("key").into_bytes(), &String::from("value").into_bytes());
+        let compacted_path = Segment::data_path(1, true, &dir);
+        let index_path = Segment::index_path(1, &dir);
         fs::remove_file(&compacted_path);
         fs::remove_file(&index_path);
-        let cc = segment.compact(&compacted_path, &index_path);
+        let cc = segment.compact(&dir);
 
         // let compacted_file = File::open(compacted_path).unwrap();
         // let mut compacted_segment = Segment::from_file_with_index(compacted_file, &index_path);
