@@ -22,6 +22,8 @@ use crate::segment::SegmentError;
 pub mod segment;
 pub mod command;
 pub mod config;
+mod memtable;
+mod wal;
 
 const FILE_SIZE_LIMIT: u64 = 200;
 
