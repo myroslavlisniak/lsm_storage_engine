@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 extern crate byteorder;
 extern crate config as config_lib;
 extern crate crc;
