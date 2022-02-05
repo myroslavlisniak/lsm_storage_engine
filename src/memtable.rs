@@ -1,14 +1,24 @@
-use std::collections::BTreeMap;
+use std::collections::{btree_map, BTreeMap};
 use std::convert::TryFrom;
-use std::fs::File;
-use std::io;
-use std::io::{Cursor, Read, Write};
-use std::path::PathBuf;
+use std::fs::{File, OpenOptions};
+use std::{alloc, io};
+use std::io::{Cursor, Read, Write, SeekFrom, Seek};
+use std::path::{Path, PathBuf};
+use std::iter::Iterator;
+use std::time::{SystemTime, UNIX_EPOCH};
+use std::vec::IntoIter;
+use base64::{encode as base64_encode};
+use byteorder::{LittleEndian, WriteBytesExt};
+use sha2::{Sha256, Digest};
+use sha2::digest::DynDigest;
+use crate::sstable::SSTable;
 
 use crate::wal::CommandLog;
 use crate::wal::LogRecord;
+use crate::sstable::SSTableMetadata;
 
 pub type ByteString = Vec<u8>;
+type InMemoryFile = Cursor<ByteString>;
 
 pub struct MemTable<T: Read + Write> {
     data: BTreeMap<ByteString, ByteString>,
@@ -16,7 +26,7 @@ pub struct MemTable<T: Read + Write> {
     bytes: usize,
 }
 
-impl MemTable<File>{
+impl MemTable<File> {
     pub fn new() -> MemTable<File> {
         let log: CommandLog<File> = CommandLog::new(PathBuf::from("./wal.log"));
         MemTable {
@@ -26,9 +36,10 @@ impl MemTable<File>{
         }
     }
 }
-impl MemTable<Cursor<Vec<u8>>> {
-    pub fn new() -> MemTable<Cursor<Vec<u8>>> {
-        let log: CommandLog<Cursor<Vec<u8>>> = CommandLog::new_in_memory(Vec::new());
+
+impl MemTable<InMemoryFile> {
+    pub fn new_in_memory_log() -> MemTable<InMemoryFile> {
+        let log: CommandLog<InMemoryFile> = CommandLog::new_in_memory(Vec::new());
         MemTable {
             data: BTreeMap::new(),
             wal: log,
@@ -36,9 +47,24 @@ impl MemTable<Cursor<Vec<u8>>> {
         }
     }
 }
+impl<T: Read + Write> IntoIterator for MemTable<T> {
+    type Item = (ByteString, ByteString);
+    type IntoIter = btree_map::IntoIter<ByteString, ByteString>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.data.into_iter()
+    }
+}
+impl<'a, T: Read + Write> IntoIterator for &'a MemTable<T> {
+    type Item = (&'a ByteString, &'a ByteString);
+    type IntoIter = btree_map::Iter<'a, ByteString, ByteString>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        (&self.data).into_iter()
+    }
+}
+
 impl<T: Read + Write> MemTable<T> {
-
-
     pub fn get(&self, key: &ByteString) -> Option<&ByteString> {
         self.data.get(key)
     }
@@ -47,8 +73,8 @@ impl<T: Read + Write> MemTable<T> {
         let key_len = key.len();
         let val_len = val.len();
         let prev = self.data.insert(key, val);
-        let prev_val_size = prev.as_ref().map(|v| v.len()).unwrap_or(0);
-        self.bytes += key_len + val_len - prev_val_size;
+        let prev_val_size = prev.as_ref().map(|v| v.len() + key_len).unwrap_or(0);
+        self.bytes = self.bytes + key_len + val_len - prev_val_size;
         prev
     }
 
@@ -59,12 +85,15 @@ impl<T: Read + Write> MemTable<T> {
         self.bytes -= prev_size;
         prev
     }
+
     pub fn size(&self) -> usize {
         self.data.len()
     }
+
     pub fn size_in_bytes(&self) -> usize {
         self.bytes
     }
+
 }
 
 impl<T: Read + Write> TryFrom<CommandLog<T>> for MemTable<T> {
@@ -103,7 +132,7 @@ mod tests {
     use std::io;
     use std::io::Cursor;
 
-    use crate::memtable::MemTable;
+    use crate::memtable::{InMemoryFile, MemTable};
     use crate::wal::{CommandLog, LogRecord};
 
     #[test]
@@ -117,13 +146,27 @@ mod tests {
         ];
 
         for record in records {
-           log.log(&record).unwrap();
+            log.log(&record).unwrap();
         }
         let vec = log.inner();
-        let log= CommandLog::new_in_memory(vec);
+        let log = CommandLog::new_in_memory(vec);
 
         let table = MemTable::try_from(log)?;
         assert_eq!(table.get("key1".as_bytes().to_vec().as_ref()), Some("value1".as_bytes().to_vec().as_ref()));
+        Ok(())
+    }
+
+    #[test]
+    fn size_after_insert() -> io::Result<()> {
+        let mut table: MemTable<InMemoryFile> = MemTable::new_in_memory_log();
+        table.insert("key".as_bytes().to_vec(), "value".as_bytes().to_vec());
+        assert_eq!(8, table.size_in_bytes());
+        table.remove(&"key1".as_bytes().to_vec());
+        assert_eq!(8, table.size_in_bytes());
+        table.insert("key".as_bytes().to_vec(), "v".as_bytes().to_vec());
+        assert_eq!(4, table.size_in_bytes());
+        table.remove(&"key".as_bytes().to_vec());
+        assert_eq!(0, table.size_in_bytes());
         Ok(())
     }
 }
