@@ -13,6 +13,8 @@ use sha2::{Digest, Sha256};
 
 use crate::memtable::{ByteString, MemTable};
 use crate::segment::KeyValuePair;
+extern crate probabilistic_collections;
+use probabilistic_collections::bloom::BloomFilter;
 
 #[derive(Serialize, Deserialize)]
 struct Checksums {
@@ -28,7 +30,7 @@ pub struct SSTableMetadata {
     checksum_filename: String,
     data_filename: String,
     index_filename: String,
-    bloom_filter_filename: Option<String>,
+    bloom_filter_filename: String,
 }
 
 
@@ -44,6 +46,7 @@ impl SSTableMetadata {
         let data_filename = format!("data_{}.db", timestamp);
         let index_filename = format!("index_{}.db", timestamp);
         let checksum_filename = format!("checksum_{}.db", timestamp);
+        let bloom_filter_filename = format!("bloom_{}.db", timestamp);
         SSTableMetadata {
             base_path,
             level: 0,
@@ -51,35 +54,34 @@ impl SSTableMetadata {
             data_filename,
             index_filename,
             checksum_filename,
-            bloom_filter_filename: None,
+            bloom_filter_filename,
         }
     }
-    fn data_path(&self) -> PathBuf {
+    fn construct_path(&self, filename: &str) -> PathBuf {
         let mut path = PathBuf::from(&self.base_path);
         path.push(format!("level-{}", self.level));
-        path.push(&self.data_filename);
+        path.push(filename);
         path
+    }
+
+    fn data_path(&self) -> PathBuf {
+        self.construct_path(&self.data_filename)
     }
 
     fn index_path(&self) -> PathBuf {
-        let mut path = PathBuf::from(&self.base_path);
-        path.push(format!("level-{}", self.level));
-        path.push(&self.index_filename);
-        path
+        self.construct_path(&self.index_filename)
     }
 
     fn checksum_path(&self) -> PathBuf {
-        let mut path = PathBuf::from(&self.base_path);
-        path.push(format!("level-{}", self.level));
-        path.push(&self.checksum_filename);
-        path
+        self.construct_path(&self.checksum_filename)
     }
 
     fn metadata_path(&self) -> PathBuf {
-        let mut path = PathBuf::from(&self.base_path);
-        path.push(format!("level-{}", self.level));
-        path.push(&self.metadata_filename);
-        path
+        self.construct_path(&self.metadata_filename)
+    }
+
+    fn bloom_filter_path(&self) -> PathBuf {
+        self.construct_path(&self.bloom_filter_filename)
     }
 
     fn load(metadata_path: &Path) -> io::Result<SSTableMetadata> {
@@ -96,11 +98,14 @@ pub struct SSTable<T: Seek + Read> {
     metadata: SSTableMetadata,
     data: T,
     index: BTreeMap<ByteString, u64>,
-    //TODO add bloom filter here
+    bloom_filter: BloomFilter<ByteString>
 }
 
 impl<T: Seek + Read> SSTable<T> {
     pub fn get(&mut self, key: &ByteString) -> io::Result<Option<ByteString>> {
+        if !self.bloom_filter.contains(key) {
+            return Ok(None);
+        }
         match self.index.get(key) {
             Some(pos) => {
                 let (record, _) = self.read_record(*pos)?;
@@ -178,12 +183,19 @@ impl SSTable<File> {
             .read(true)
             .open(&metadata.index_path())
             .expect("Can't create/open data file");
+        let bloom_filter_file = OpenOptions::new()
+            .read(true)
+            .open(&metadata.bloom_filter_path())
+            .expect("Cant'create/open bloom filter file");
         let index: BTreeMap<ByteString, u64> = bincode::deserialize_from(index_file)
+            .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
+        let bloom_filter: BloomFilter<ByteString> = bincode::deserialize_from(bloom_filter_file)
             .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
         Ok(SSTable {
             metadata,
             data: data_file,
             index,
+            bloom_filter
         })
     }
 
@@ -194,17 +206,19 @@ impl SSTable<File> {
             path_buf.push(format!("level-{}", i));
             std::fs::create_dir_all(&path_buf);
         }
-        let (data_file, index) = SSTable::write_data_file(&metadata, memtable)?;
+        let (data_file, index, bloom_filter) = SSTable::write_data_file(&metadata, memtable)?;
         SSTable::write_index(&metadata, &index)?;
         SSTable::write_checksums(&metadata)?;
+        SSTable::write_bloom_filter(&metadata, &bloom_filter)?;
         SSTable::write_metadata(&metadata)?;
         Ok(SSTable {
             metadata,
             data: data_file,
             index,
+            bloom_filter
         })
     }
-    fn write_data_file<Log: Read + Write>(metadata: &SSTableMetadata, memtable: &MemTable<Log>) -> io::Result<(File, BTreeMap<ByteString, u64>)> {
+    fn write_data_file<Log: Read + Write>(metadata: &SSTableMetadata, memtable: &MemTable<Log>) -> io::Result<(File, BTreeMap<ByteString, u64>, BloomFilter<ByteString>)> {
         let mut data_file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -213,6 +227,7 @@ impl SSTable<File> {
             .open(&metadata.data_path())
             .expect("Can't create/open data file");
         let mut index: BTreeMap<ByteString, u64> = BTreeMap::new();
+        let mut bloom_filter = BloomFilter::<ByteString>::new(memtable.size(), 0.01);
         let mut pos = 0;
         for (i, (key, val)) in memtable.into_iter().enumerate() {
             let key_len = key.len() as u32;
@@ -221,13 +236,14 @@ impl SSTable<File> {
             data_file.write_u32::<LittleEndian>(val_len)?;
             data_file.write_all(&key)?;
             data_file.write_all(&val)?;
+            bloom_filter.insert(key);
             if i % 100 == 0 {
                 index.insert(key.clone(), pos);
             }
             pos += u64::from(8 + key_len + val_len);
         }
         data_file.flush()?;
-        Ok((data_file, index))
+        Ok((data_file, index, bloom_filter))
     }
 
     fn write_checksums(metadata: &SSTableMetadata) -> io::Result<()> {
@@ -282,6 +298,16 @@ impl SSTable<File> {
         serde_json::to_writer(metadata_file, metadata)
             .map_err(|e| io::Error::from(e))
     }
+
+    fn write_bloom_filter(metadata: &SSTableMetadata, bloom_filter: &BloomFilter<ByteString>) -> io::Result<()> {
+        let bloom_filter_file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .open(&metadata.bloom_filter_path())?;
+        bincode::serialize_into(bloom_filter_file, bloom_filter)
+            .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))
+
+    }
 }
 
 #[cfg(test)]
@@ -308,6 +334,7 @@ mod tests {
             assert_eq!(true, val.is_some());
             assert_eq!((i*100).to_string().into_bytes(), val.unwrap());
         }
+        assert_eq!(None, sstable.get(&"1000".to_string().into_bytes())?);
         Ok(())
     }
 
@@ -331,6 +358,7 @@ mod tests {
             assert_eq!(true, val.is_some());
             assert_eq!((i*100).to_string().into_bytes(), val.unwrap());
         }
+
         Ok(())
     }
 }
