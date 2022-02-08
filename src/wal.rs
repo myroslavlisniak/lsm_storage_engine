@@ -1,7 +1,7 @@
 use std::convert::TryFrom;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Cursor, ErrorKind, Read, Seek, SeekFrom, Write};
-use std::io;
+use std::{fs, io};
 use std::path::PathBuf;
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -46,6 +46,7 @@ pub enum LogRecord {
 
 pub struct CommandLog<T: Read + Write> {
     file: T,
+    path: Option<PathBuf>
 }
 
 impl<T: Read + Write> Write for CommandLog<T> {
@@ -86,7 +87,8 @@ impl CommandLog<Cursor<Vec<u8>>> {
         let mut cursor = Cursor::new(vec);
         cursor.seek(SeekFrom::Start(0)).unwrap();
         CommandLog{
-            file: cursor
+            file: cursor,
+            path: None,
         }
     }
     pub fn inner(self) -> Vec<u8>{
@@ -94,20 +96,28 @@ impl CommandLog<Cursor<Vec<u8>>> {
     }
 }
 impl CommandLog<File> {
-    pub fn new(path: PathBuf) -> CommandLog<File> {
+    pub fn new(path: PathBuf) -> io::Result<CommandLog<File>> {
         // let path = PathBuf::from("./wal.log");
         let mut new_file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .append(true)
-            .open(&path).expect("Can't create/open wal.log file");
-        new_file.seek(SeekFrom::Start(0)).unwrap();
-        CommandLog {
-            file: new_file
-        }
-
+            .open(&path)?;
+        new_file.seek(SeekFrom::Start(0))?;
+        Ok(CommandLog {
+            file: new_file,
+            path: Some(path)
+        })
     }
+
+    pub fn close(&self) -> io::Result<()> {
+        match &self.path {
+            Some(val) => fs::remove_file(val),
+            None => Ok(())
+        }
+    }
+
 }
 impl<T: Read + Write> CommandLog<T> {
 
@@ -180,6 +190,7 @@ impl<T: Read + Write> CommandLog<T> {
                 f.write_u32::<LittleEndian>(key.len() as u32)?;
                 f.write_u32::<LittleEndian>(val.len() as u32)?;
                 f.write_all(&tmp)?;
+                f.flush()?;
                 Ok(data_len + 5)
             }
             LogRecord::Remove(key) => {
@@ -188,6 +199,7 @@ impl<T: Read + Write> CommandLog<T> {
                 f.write_u32::<LittleEndian>(checksum)?;
                 f.write_u32::<LittleEndian>(key.len() as u32)?;
                 f.write_all(key)?;
+                f.flush()?;
                 Ok(key.len() + 5)
             }
         }

@@ -27,6 +27,7 @@ pub mod config;
 mod memtable;
 mod wal;
 mod sstable;
+mod lsm_storage;
 
 const FILE_SIZE_LIMIT: u64 = 200;
 

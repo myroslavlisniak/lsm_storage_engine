@@ -27,14 +27,29 @@ pub struct MemTable<T: Read + Write> {
 }
 
 impl MemTable<File> {
-    pub fn new() -> MemTable<File> {
-        let log: CommandLog<File> = CommandLog::new(PathBuf::from("./wal.log"));
+    pub fn new(base_path: &str) -> MemTable<File> {
+        let start = SystemTime::now();
+        let since_the_epoch = start
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards");
+
+        let timestamp = since_the_epoch.as_millis();
+        let mut path_buf = PathBuf::from(base_path);
+        path_buf.push("wal");
+        path_buf.push(format!("wal.log"));
+        let log: CommandLog<File> = CommandLog::new(path_buf).unwrap();
         MemTable {
             data: BTreeMap::new(),
             wal: log,
             bytes: 0,
         }
+
     }
+
+    pub fn close(&mut self) -> io::Result<()> {
+        self.wal.close()
+    }
+
 }
 
 impl MemTable<InMemoryFile> {
@@ -93,6 +108,7 @@ impl<T: Read + Write> MemTable<T> {
     pub fn size_in_bytes(&self) -> usize {
         self.bytes
     }
+
 
 }
 
