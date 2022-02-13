@@ -1,22 +1,29 @@
 extern crate probabilistic_collections;
 
+use std::{fs, io};
 use std::cmp::Ordering;
 use std::collections::btree_map::Range;
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
-use std::{fs, io};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::encode as base64_encode;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use log::debug;
 use probabilistic_collections::bloom::BloomFilter;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use crate::ByteStr;
 
 use crate::lsm_storage::KeyValuePair;
 use crate::memtable::{ByteString, MemTable};
+
+const INDEX_STEP: usize = 100;
+
+type SstableIndex = BTreeMap<ByteString, u64>;
+type SstableBloomFilter = BloomFilter<ByteString>;
 
 #[derive(Serialize, Deserialize)]
 struct Checksums {
@@ -25,7 +32,7 @@ struct Checksums {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-pub struct SSTableMetadata {
+pub struct SsTableMetadata {
     base_path: String,
     id: u128,
     level: u8,
@@ -37,8 +44,8 @@ pub struct SSTableMetadata {
 }
 
 
-impl SSTableMetadata {
-    pub fn new(base_path: String, level: u8) -> SSTableMetadata {
+impl SsTableMetadata {
+    pub fn new(base_path: String, level: u8) -> SsTableMetadata {
         let start = SystemTime::now();
         let since_the_epoch = start
             .duration_since(UNIX_EPOCH)
@@ -50,7 +57,7 @@ impl SSTableMetadata {
         let index_filename = format!("index_{}.db", timestamp);
         let checksum_filename = format!("checksum_{}.db", timestamp);
         let bloom_filter_filename = format!("bloom_{}.db", timestamp);
-        SSTableMetadata {
+        SsTableMetadata {
             base_path,
             level,
             id: timestamp,
@@ -88,30 +95,57 @@ impl SSTableMetadata {
         self.construct_path(&self.bloom_filter_filename)
     }
 
-    pub fn load(metadata_path: &Path) -> io::Result<SSTableMetadata> {
+    pub fn load(metadata_path: &Path) -> io::Result<SsTableMetadata> {
         let metadata_file = OpenOptions::new()
             .read(true)
             .open(metadata_path)
             .expect("Can't open metadata file");
         serde_json::from_reader(metadata_file)
-            .map_err(|e| io::Error::from(e))
+            .map_err(io::Error::from)
     }
 }
 
-pub struct SSTable<T: Seek + Read> {
-    metadata: SSTableMetadata,
+pub struct SsTable<T: Seek + Read> {
+    metadata: SsTableMetadata,
     data: T,
-    index: BTreeMap<ByteString, u64>,
-    bloom_filter: BloomFilter<ByteString>,
+    index: SstableIndex,
+    bloom_filter: SstableBloomFilter,
     size_bytes: u64,
 }
 
-pub struct Iter<'a, T: Seek + Read> {
-    table: &'a mut SSTable<T>,
-    pos: u64,
+impl Clone for SsTable<File> {
+    fn clone(&self) -> Self {
+        let metadata = self.metadata.clone();
+        SsTable::load(&metadata.metadata_path())
+            .expect("Can't clone sstable")
+    }
 }
 
-impl<'a, T: Seek + Read> IntoIterator for &'a mut SSTable<T> {
+impl<T: Seek + Read> PartialEq<Self> for SsTable<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.id() == other.id()
+    }
+}
+
+impl<T: Seek + Read> Eq for SsTable<T> {}
+
+impl<T: Seek + Read> PartialOrd for SsTable<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<T: Seek + Read> Ord for SsTable<T> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        if self.eq(other) { Ordering::Equal } else if self.id() < other.id() {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        }
+    }
+}
+
+impl<'a, T: Seek + Read> IntoIterator for &'a mut SsTable<T> {
     type Item = KeyValuePair;
 
     type IntoIter = Iter<'a, T>;
@@ -122,6 +156,11 @@ impl<'a, T: Seek + Read> IntoIterator for &'a mut SSTable<T> {
             pos: 0,
         }
     }
+}
+
+pub struct Iter<'a, T: Seek + Read> {
+    table: &'a mut SsTable<T>,
+    pos: u64,
 }
 
 impl<'a, T: Seek + Read> Iterator for Iter<'a, T> {
@@ -142,57 +181,26 @@ impl<'a, T: Seek + Read> Iterator for Iter<'a, T> {
     }
 }
 
-impl Clone for SSTable<File> {
-    fn clone(&self) -> Self {
-        let metadata = self.metadata.clone();
-        SSTable::load(&metadata.metadata_path())
-            .expect("Can't clone sstable")
-    }
-}
-
-impl<T: Seek + Read> PartialEq<Self> for SSTable<T> {
-    fn eq(&self, other: &Self) -> bool {
-        self.id() == other.id()
-    }
-}
-
-impl<T: Seek + Read> Eq for SSTable<T> {}
-
-impl<T: Seek + Read> PartialOrd for SSTable<T> {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl<T: Seek + Read> Ord for SSTable<T> {
-    fn cmp(&self, other: &Self) -> Ordering {
-        if self.eq(other) { Ordering::Equal } else if self.id() < other.id() {
-            Ordering::Less
-        } else {
-            Ordering::Greater
-        }
-    }
-}
-
-impl<T: Seek + Read> SSTable<T> {
+impl<T: Seek + Read> SsTable<T> {
     pub fn id(&self) -> u128 {
         self.metadata.id
     }
 
-    pub fn get(&mut self, key: &ByteString) -> io::Result<Option<ByteString>> {
+    pub fn get(&mut self, key: &ByteStr) -> io::Result<Option<ByteString>> {
         if !self.bloom_filter.contains(key) {
             return Ok(None);
         }
         match self.index.get(key) {
             Some(pos) => {
-                let (record, _) = self.read_record(*pos)?;
-                return Ok(Some(record.value));
+                let position = *pos;
+                let (record, _) = self.read_record(position)?;
+                Ok(Some(record.value))
             }
             None => {
-                let mut range: Range<ByteString, u64> = self.index.range::<ByteString, _>(..key);
+                let mut range: Range<ByteString, u64> = self.index.range::<ByteString, _>(..key.to_vec());
                 if let Some((_, start)) = range.next_back() {
                     let mut pos = *start;
-                    let mut range: Range<ByteString, u64> = self.index.range::<ByteString, _>(key..);
+                    let mut range: Range<ByteString, u64> = self.index.range::<ByteString, _>(key.to_vec()..);
                     let end = range.next().map(|e| *e.1);
                     loop {
                         match self.read_record(pos) {
@@ -209,9 +217,10 @@ impl<T: Seek + Read> SSTable<T> {
                                     _ => return Err(err)
                                 }
                         }
-                        match end {
-                            Some(e) => if pos == e { break; }
-                            None => ()//do nothing
+                        if let Some(e) = end {
+                            if pos >= e {
+                                break;
+                            }
                         }
                     }
                 }
@@ -236,19 +245,17 @@ impl<T: Seek + Read> SSTable<T> {
     }
 }
 
-const INDEX_STEP: usize = 100;
 
-
-impl SSTable<File> {
-    pub fn load(metadata_path: &Path) -> io::Result<SSTable<File>> {
-        let metadata = SSTableMetadata::load(metadata_path)?;
-        let calculated_data_hash = SSTable::calculate_checksum(&metadata.data_path())?;
-        let calculated_index_hash = SSTable::calculate_checksum(&metadata.index_path())?;
+impl SsTable<File> {
+    pub fn load(metadata_path: &Path) -> io::Result<SsTable<File>> {
+        let metadata = SsTableMetadata::load(metadata_path)?;
+        let calculated_data_hash = SsTable::calculate_checksum(&metadata.data_path())?;
+        let calculated_index_hash = SsTable::calculate_checksum(&metadata.index_path())?;
         let checksum_file = OpenOptions::new()
             .read(true)
             .open(&metadata.checksum_path())
             .expect("Can't open checksum file");
-        let checksums: Checksums = serde_json::from_reader(checksum_file).map_err(|e| io::Error::from(e))?;
+        let checksums: Checksums = serde_json::from_reader(checksum_file).map_err(io::Error::from)?;
         if calculated_data_hash != checksums.data_checksum {
             panic!("Can't load SSTable from {}. Checksum is not correct", &metadata.data_filename);
         }
@@ -273,16 +280,108 @@ impl SSTable<File> {
             .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
         let size = data_file.seek(SeekFrom::End(0))?;
         data_file.seek(SeekFrom::Start(0))?;
-        Ok(SSTable {
+        Ok(SsTable {
             metadata,
             data: data_file,
             index,
             bloom_filter,
-            size_bytes: size
+            size_bytes: size,
         })
     }
 
-    pub fn close(&self) -> io::Result<()>{
+    pub fn from_memtable<Log: Read + Write>(base_path: &str, memtable: &MemTable<Log>) -> io::Result<SsTable<File>> {
+        let metadata = SsTableMetadata::new(base_path.to_string(), 0);
+        let (data_file, index, bloom_filter, size) =
+            SsTable::write_data_file(&metadata, memtable)?;
+        SsTable::write_index(&metadata, &index)?;
+        SsTable::write_checksums(&metadata)?;
+        SsTable::write_bloom_filter(&metadata, &bloom_filter)?;
+        SsTable::write_metadata(&metadata)?;
+        Ok(SsTable {
+            metadata,
+            data: data_file,
+            index,
+            bloom_filter,
+            size_bytes: size,
+        })
+    }
+
+    pub fn merge_compact(tables: &mut Vec<SsTable<File>>, level: u8, base_path: &str) -> io::Result<SsTable<File>> {
+        let size: u64 = tables.iter().map(|table| table.size_bytes).sum();
+        let mut iterators = Vec::with_capacity(tables.len());
+        let mut values = Vec::with_capacity(tables.len());
+        for table in tables.iter_mut() {
+            let mut iterator = table.into_iter();
+            let value = iterator.next();
+            iterators.push(iterator);
+            values.push(value);
+        }
+        let metadata = SsTableMetadata::new(base_path.to_string(), level);
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&metadata.data_path())?;
+        let mut index: BTreeMap<ByteString, u64> = BTreeMap::new();
+        let mut bloom_filter = BloomFilter::<ByteString>::new((size / 40) as usize, 0.01);
+        let mut pos = 0u64;
+        let mut counter = 0usize;
+        loop {
+            let mut current_idx: Option<usize> = None;
+            for i in 0..iterators.len() {
+                if let Some(kv) = values[i].as_ref() {
+                    match current_idx {
+                        None => {
+                            current_idx = Some(i);
+                        }
+                        Some(curr) => {
+                            if kv.key <= values[curr].as_ref().unwrap().key {
+                                current_idx = Some(i);
+                            }
+                            if values[curr].as_ref().unwrap().key == kv.key {
+                                values[curr] = (&mut iterators[curr]).next()
+                            }
+                        }
+                    }
+                }
+            }
+            match current_idx {
+                Some(idx) => {
+                    let kv = values[idx].as_ref().unwrap();
+                    if kv.value == vec![0] {
+                        continue;
+                    }
+                    let diff = Self::write_key_value(&mut file, &kv.key, &kv.value)?;
+                    if counter % INDEX_STEP == 0 {
+                        index.insert(kv.key.clone(), pos);
+                    }
+                    counter += 1;
+                    pos += diff;
+                    bloom_filter.insert(&kv.key);
+                    values[idx] = (&mut iterators[idx]).next();
+                }
+                None => break
+            }
+        }
+        SsTable::write_index(&metadata, &index)?;
+        SsTable::write_checksums(&metadata)?;
+        SsTable::write_bloom_filter(&metadata, &bloom_filter)?;
+        SsTable::write_metadata(&metadata)?;
+        let size = file.seek(SeekFrom::End(0))?;
+
+        let data_file = OpenOptions::new()
+            .read(true)
+            .open(&metadata.data_path())?;
+
+        Ok(SsTable {
+            metadata,
+            data: data_file,
+            index,
+            bloom_filter,
+            size_bytes: size,
+        })
+    }
+
+    pub fn close(&self) -> io::Result<()> {
         fs::remove_file(self.metadata.metadata_path())?;
         fs::remove_file(self.metadata.bloom_filter_path())?;
         fs::remove_file(self.metadata.index_path())?;
@@ -290,39 +389,19 @@ impl SSTable<File> {
         fs::remove_file(self.metadata.data_path())
     }
 
-    pub fn from_memtable<Log: Read + Write>(base_path: &str, memtable: &MemTable<Log>) -> io::Result<SSTable<File>> {
-        let metadata = SSTableMetadata::new(base_path.to_string(), 0);
-        for i in 0..5 {
-            let mut path_buf = PathBuf::from(base_path);
-            path_buf.push(format!("level-{}", i));
-            std::fs::create_dir_all(&path_buf);
-        }
-        let (data_file, index, bloom_filter, size) = SSTable::write_data_file(&metadata, memtable)?;
-        SSTable::write_index(&metadata, &index)?;
-        SSTable::write_checksums(&metadata)?;
-        SSTable::write_bloom_filter(&metadata, &bloom_filter)?;
-        SSTable::write_metadata(&metadata)?;
-        Ok(SSTable {
-            metadata,
-            data: data_file,
-            index,
-            bloom_filter,
-            size_bytes: size
-        })
-    }
-    fn write_data_file<Log: Read + Write>(metadata: &SSTableMetadata, memtable: &MemTable<Log>) -> io::Result<(File, BTreeMap<ByteString, u64>, BloomFilter<ByteString>, u64)> {
+    fn write_data_file<Log: Read + Write>(metadata: &SsTableMetadata, memtable: &MemTable<Log>) -> io::Result<(File, SstableIndex, SstableBloomFilter, u64)> {
         let mut data_file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .append(true)
             .open(&metadata.data_path())
-            .expect("Can't create/open data file");
+            .unwrap_or_else(|_| panic!("Can't create/open data file {}", &metadata.metadata_filename));
         let mut index: BTreeMap<ByteString, u64> = BTreeMap::new();
         let mut bloom_filter = BloomFilter::<ByteString>::new(memtable.size(), 0.01);
         let mut pos = 0;
         for (i, (key, val)) in memtable.into_iter().enumerate() {
-            let diff = SSTable::write_key_value(&mut data_file, key, val)?;
+            let diff = SsTable::write_key_value(&mut data_file, key, val)?;
             bloom_filter.insert(key);
             if i % INDEX_STEP == 0 {
                 index.insert(key.clone(), pos);
@@ -330,10 +409,14 @@ impl SSTable<File> {
             pos += diff;
         }
         data_file.flush()?;
+
+        let data_file = OpenOptions::new()
+            .read(true)
+            .open(&metadata.data_path())?;
         Ok((data_file, index, bloom_filter, pos))
     }
 
-    fn write_key_value(data_file: &mut File, key: &ByteString, val: &ByteString) -> io::Result<u64> {
+    fn write_key_value(data_file: &mut File, key: &ByteStr, val: &ByteStr) -> io::Result<u64> {
         let key_len = key.len() as u32;
         let val_len = val.len() as u32;
         data_file.write_u32::<LittleEndian>(key_len)?;
@@ -343,10 +426,10 @@ impl SSTable<File> {
         Ok(u64::from(8 + key_len + val_len))
     }
 
-    fn write_checksums(metadata: &SSTableMetadata) -> io::Result<()> {
-        let data_base64_hash = SSTable::calculate_checksum(&metadata.data_path())?;
-        let index_base64_hash = SSTable::calculate_checksum(&metadata.index_path())?;
-        println!("Base64-encoded hash: {}", data_base64_hash);
+    fn write_checksums(metadata: &SsTableMetadata) -> io::Result<()> {
+        let data_base64_hash = SsTable::calculate_checksum(&metadata.data_path())?;
+        let index_base64_hash = SsTable::calculate_checksum(&metadata.index_path())?;
+        debug!("Base64-encoded hash: {}, for file: {}", data_base64_hash, &metadata.data_filename);
         let checksums = Checksums {
             index_checksum: index_base64_hash,
             data_checksum: data_base64_hash,
@@ -356,7 +439,7 @@ impl SSTable<File> {
             .create(true)
             .open(&metadata.checksum_path())?;
         serde_json::to_writer(checksum_file, &checksums)
-            .map_err(|e| io::Error::from(e))
+            .map_err(io::Error::from)
     }
 
     fn calculate_checksum(path: &Path) -> io::Result<String> {
@@ -379,7 +462,7 @@ impl SSTable<File> {
         Ok(base64_encode(&hash))
     }
 
-    fn write_index(metadata: &SSTableMetadata, index: &BTreeMap<ByteString, u64>) -> io::Result<()> {
+    fn write_index(metadata: &SsTableMetadata, index: &BTreeMap<ByteString, u64>) -> io::Result<()> {
         let index_file = OpenOptions::new()
             .write(true)
             .create(true)
@@ -387,16 +470,17 @@ impl SSTable<File> {
         bincode::serialize_into(index_file, &index)
             .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))
     }
-    fn write_metadata(metadata: &SSTableMetadata) -> io::Result<()> {
+
+    fn write_metadata(metadata: &SsTableMetadata) -> io::Result<()> {
         let metadata_file = OpenOptions::new()
             .write(true)
             .create(true)
             .open(&metadata.metadata_path())?;
         serde_json::to_writer(metadata_file, metadata)
-            .map_err(|e| io::Error::from(e))
+            .map_err(io::Error::from)
     }
 
-    fn write_bloom_filter(metadata: &SSTableMetadata, bloom_filter: &BloomFilter<ByteString>) -> io::Result<()> {
+    fn write_bloom_filter(metadata: &SsTableMetadata, bloom_filter: &BloomFilter<ByteString>) -> io::Result<()> {
         let bloom_filter_file = OpenOptions::new()
             .write(true)
             .create(true)
@@ -405,145 +489,82 @@ impl SSTable<File> {
             .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))
     }
 
-    pub fn merge_compact(tables: &mut Vec<SSTable<File>>, level: u8, base_path: &str) -> io::Result<SSTable<File>> {
-        let size: u64 = tables.iter().map(|table| table.size_bytes).sum();
-        let mut iterators = Vec::with_capacity(tables.len());
-        for table in tables.into_iter() {
-            let mut iterator = table.into_iter();
-            let value = iterator.next();
-            iterators.push((iterator, value));
-        }
-        let metadata = SSTableMetadata::new(base_path.to_string(), level);
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&metadata.data_path())?;
-        let mut index: BTreeMap<ByteString, u64> = BTreeMap::new();
-        let mut bloom_filter = BloomFilter::<ByteString>::new((size / 40) as usize, 0.01);
-        let mut pos = 0u64;
-        let mut counter = 0usize;
-        loop {
-            let mut current: Option<&KeyValuePair> = None;
-            let mut idx = 0;
-            for i in 0..iterators.len() {
-                match iterators[i].1.as_ref() {
-                    Some(kv) => {
-                        if current.is_none() || kv.key <= current.unwrap().key {
-                            current = Some(kv);
-                            idx = i;
-                        }
-                    }
-                    None => ()
-                }
-            }
-            match current {
-                Some(kv) => {
-                    let diff = Self::write_key_value(&mut file, &kv.key, &kv.value)?;
-                    if counter % INDEX_STEP == 0 {
-                        index.insert(kv.key.clone(), pos);
-                    }
-                    counter += 1;
-                    bloom_filter.insert(&kv.key);
-                    pos += diff;
-                    let mut iter = &mut iterators[idx].0;
-                    let next_val = iter.next();
-                    iterators[idx].1 = next_val;
-                }
-                None => break
-            }
-        }
-        SSTable::write_index(&metadata, &index)?;
-        SSTable::write_checksums(&metadata)?;
-        SSTable::write_bloom_filter(&metadata, &bloom_filter)?;
-        SSTable::write_metadata(&metadata)?;
-        let size = file.seek(SeekFrom::End(0))?;
-
-        let data_file = OpenOptions::new()
-            .read(true)
-            .open(&metadata.data_path())?;
-
-        Ok(SSTable {
-            metadata,
-            data: data_file,
-            index,
-            bloom_filter,
-            size_bytes: size
-        })
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::{env, fs};
 
-    use tokio::io;
-
     use crate::memtable::MemTable;
-    use crate::sstable::SSTable;
+    use crate::sstable::SsTable;
 
-    #[test]
-    fn sstable_test() -> io::Result<()> {
-        let mut memtable = MemTable::new_in_memory_log();
-        for i in 0..500 {
-            let val = i * 100;
-            memtable.insert(i.to_string().into_bytes(), val.to_string().into_bytes());
-        }
+    fn prepare_directories() -> String{
         let mut buf = env::temp_dir();
         buf.push("sstable_test");
         let base_dir = buf.to_str().expect("Can't get temp directory");
-        fs::create_dir_all(base_dir)?;
-        let mut sstable = SSTable::from_memtable(base_dir, &memtable)?;
-        for i in 0..500 {
-            let val = sstable.get(&i.to_string().into_bytes())?;
-            assert_eq!(true, val.is_some());
-            assert_eq!((i * 100).to_string().into_bytes(), val.unwrap());
+        fs::remove_dir_all(base_dir).unwrap_or(());
+        fs::create_dir_all(base_dir).unwrap();
+        for i in 0..5 {
+            let mut path_buf = buf.clone();
+            path_buf.push(format!("level-{}", i));
+            std::fs::create_dir_all(&path_buf).unwrap();
         }
-        assert_eq!(None, sstable.get(&"1000".to_string().into_bytes())?);
-        Ok(())
+        base_dir.to_string()
     }
 
     #[test]
-    fn sstable_iterator_test() -> io::Result<()> {
+    fn sstable_test() {
+        let base_dir = prepare_directories();
         let mut memtable = MemTable::new_in_memory_log();
         for i in 0..500 {
             let val = i * 100;
             memtable.insert(i.to_string().into_bytes(), val.to_string().into_bytes());
         }
-        let mut buf = env::temp_dir();
-        buf.push("sstable_test");
-        let base_dir = buf.to_str().expect("Can't get temp directory");
-        fs::create_dir_all(base_dir)?;
-        let mut sstable = SSTable::from_memtable(base_dir, &memtable)?;
+        let mut sstable = SsTable::from_memtable(&base_dir, &memtable).unwrap();
+        for i in 0..500 {
+            let val = sstable.get(&i.to_string().into_bytes()).unwrap();
+            assert_eq!(true, val.is_some());
+            assert_eq!((i * 100).to_string().into_bytes(), val.unwrap());
+        }
+        assert_eq!(None, sstable.get(&"1000".to_string().into_bytes()).unwrap());
+    }
+
+    #[test]
+    fn sstable_iterator_test() {
+        let base_dir = prepare_directories();
+        let mut memtable = MemTable::new_in_memory_log();
+        let mut entries = Vec::new();
+        for i in 1..500 {
+            let val = i * 100;
+            let key = i.to_string().into_bytes();
+            let val = val.to_string().into_bytes();
+            entries.push((key.clone(), val.clone()));
+            memtable.insert(key, val);
+        }
+        let mut sstable = SsTable::from_memtable(&base_dir, &memtable).unwrap();
         let mut i = 0;
+        entries.sort_by(|a,b| a.0.cmp(&b.0));
         for kv in sstable.into_iter() {
-            assert_eq!(i.to_string().into_bytes(), kv.key);
-            assert_eq!((i * 100).to_string().into_bytes(), kv.value);
+            assert_eq!(entries[i].0, kv.key);
+            assert_eq!(entries[i].1, kv.value);
             i += 1;
         }
-        Ok(())
     }
 
     #[test]
-    fn sstable_load_from_file_test() -> io::Result<()> {
+    fn sstable_load_from_file_test() {
+        let base_dir = prepare_directories();
         let mut memtable = MemTable::new_in_memory_log();
         for i in 0..500 {
             let val = i * 100;
             memtable.insert(i.to_string().into_bytes(), val.to_string().into_bytes());
         }
-        let mut buf = env::temp_dir();
-        buf.push("sstable_from_file_test");
-        let base_dir = buf.to_str().expect("Can't get temp directory");
-        // fs::remove_dir_all(base_dir)?;
-        fs::create_dir_all(base_dir)?;
-
-        let mut sstable = SSTable::from_memtable(base_dir, &memtable)?;
-        let mut sstable = SSTable::load(&sstable.metadata.metadata_path())?;
+        let sstable = SsTable::from_memtable(&base_dir, &memtable).unwrap();
+        let mut sstable = SsTable::load(&sstable.metadata.metadata_path()).unwrap();
         for i in 0..500 {
-            let val = sstable.get(&i.to_string().into_bytes())?;
+            let val = sstable.get(&i.to_string().into_bytes()).unwrap();
             assert_eq!(true, val.is_some());
             assert_eq!((i * 100).to_string().into_bytes(), val.unwrap());
         }
-
-        Ok(())
     }
 }

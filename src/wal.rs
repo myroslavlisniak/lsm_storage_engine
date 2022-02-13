@@ -1,12 +1,13 @@
+use std::{fs, io};
 use std::convert::TryFrom;
 use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Cursor, ErrorKind, Read, Seek, SeekFrom, Write};
-use std::{fs, io};
+use std::io::{BufWriter, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use crc::crc32;
 
+use crate::ByteStr;
 use crate::memtable::ByteString;
 
 //TODO Error handling
@@ -22,20 +23,12 @@ impl TryFrom<u8> for CommandType {
         match value {
             1 => Ok(CommandType::Insert),
             2 => Ok(CommandType::Remove),
-            //FIXME:
+            //TODO: proper error handling
             _ => Err(io::Error::from_raw_os_error(1))
         }
     }
 }
 
-impl Into<u8> for CommandType {
-    fn into(self) -> u8 {
-        match self {
-            CommandType::Insert => 1,
-            CommandType::Remove => 2,
-        }
-    }
-}
 
 #[derive(PartialEq, Eq, Debug)]
 pub enum LogRecord {
@@ -46,7 +39,7 @@ pub enum LogRecord {
 
 pub struct CommandLog<T: Read + Write> {
     file: T,
-    path: Option<PathBuf>
+    path: Option<PathBuf>,
 }
 
 impl<T: Read + Write> Write for CommandLog<T> {
@@ -80,21 +73,8 @@ impl<T: Read + Write> Iterator for &mut CommandLog<T> {
             }
         }
     }
+}
 
-}
-impl CommandLog<Cursor<Vec<u8>>> {
-    pub fn new_in_memory(vec: Vec<u8>) -> CommandLog<Cursor<Vec<u8>>> {
-        let mut cursor = Cursor::new(vec);
-        cursor.seek(SeekFrom::Start(0)).unwrap();
-        CommandLog{
-            file: cursor,
-            path: None,
-        }
-    }
-    pub fn inner(self) -> Vec<u8>{
-        self.file.into_inner()
-    }
-}
 impl CommandLog<File> {
     pub fn new(path: PathBuf) -> io::Result<CommandLog<File>> {
         // let path = PathBuf::from("./wal.log");
@@ -107,7 +87,7 @@ impl CommandLog<File> {
         new_file.seek(SeekFrom::Start(0))?;
         Ok(CommandLog {
             file: new_file,
-            path: Some(path)
+            path: Some(path),
         })
     }
 
@@ -117,17 +97,14 @@ impl CommandLog<File> {
             None => Ok(())
         }
     }
-
 }
 impl<T: Read + Write> CommandLog<T> {
-
-
-    pub fn insert(&mut self, key: &ByteString, val: &ByteString) -> io::Result<usize> {
+    pub fn insert(&mut self, key: &ByteStr, val: &ByteStr) -> io::Result<usize> {
         let record = LogRecord::Insert(key.to_vec(), val.to_vec());
         self.log(&record)
     }
 
-    pub fn remove(&mut self, key: &ByteString) -> io::Result<usize> {
+    pub fn remove(&mut self, key: &ByteStr) -> io::Result<usize> {
         let record = LogRecord::Remove(key.to_vec());
         self.log(&record)
     }
@@ -143,7 +120,7 @@ impl<T: Read + Write> CommandLog<T> {
                 let data_len = key_len + val_len;
                 let mut data = ByteString::with_capacity(data_len as usize);
                 {
-                    Read::take(self,data_len as u64)
+                    Read::take(self, data_len as u64)
                         .read_to_end(&mut data)?;
                 }
                 debug_assert_eq!(data.len(), data_len as usize);
@@ -208,8 +185,23 @@ impl<T: Read + Write> CommandLog<T> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs::read;
+    use std::io::{Cursor, Seek, SeekFrom};
+
     use crate::wal::{CommandLog, LogRecord};
+
+    impl CommandLog<Cursor<Vec<u8>>> {
+        pub fn new_in_memory(vec: Vec<u8>) -> CommandLog<Cursor<Vec<u8>>> {
+            let mut cursor = Cursor::new(vec);
+            cursor.seek(SeekFrom::Start(0)).unwrap();
+            CommandLog {
+                file: cursor,
+                path: None,
+            }
+        }
+        pub fn inner(self) -> Vec<u8> {
+            self.file.into_inner()
+        }
+    }
 
     #[test]
     fn write_insert_log_record() {

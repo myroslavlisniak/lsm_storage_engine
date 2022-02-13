@@ -1,1 +1,3 @@
-base_path="/home/myroslavlisniak/petprojects/actionkv/data"
+base_path = "./data"
+memtable_limit_bytes = 4096
+sstable_level_limit = 4
