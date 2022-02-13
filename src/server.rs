@@ -1,20 +1,21 @@
-extern crate libactionkv;
+extern crate storage_engine;
 extern crate log4rs;
 
-use std::io::{BufRead, Write};
-use std::net::Shutdown;
+// use std::net::Shutdown;
 use std::sync::{Arc, Mutex};
 
-use log::{info};
+use log::{error, info};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
-use libactionkv::command::{Command, Response};
-use libactionkv::command::Response::{Found, NotFound, NotSupported};
-use libactionkv::config::Config;
-use libactionkv::Storage;
+use command::{Command, Response};
+use command::Response::{Found, NotFound, NotSupported};
+use storage_engine::config::Config;
+use storage_engine::LsmStorage;
 
-async fn handle_client(mut stream: TcpStream, db: Arc<Mutex<Storage>>) {
+mod command;
+
+async fn handle_client(stream: TcpStream, db: Arc<Mutex<LsmStorage>>) {
     let mut stream = BufReader::new(stream);
     let mut data = String::new();
 
@@ -24,7 +25,7 @@ async fn handle_client(mut stream: TcpStream, db: Arc<Mutex<Storage>>) {
 
             let result = match cmd {
                 Command::Get(key) => {
-                    let store = db.lock().unwrap();
+                    let mut store = db.lock().unwrap();
                     match store.get(&key).unwrap() {
                         None => NotFound(key),
                         Some(value) => Found(value),
@@ -37,12 +38,12 @@ async fn handle_client(mut stream: TcpStream, db: Arc<Mutex<Storage>>) {
                 }
                 Command::Insert(key, value) => {
                     let mut store = db.lock().unwrap();
-                    store.insert(&key, &value).unwrap();
+                    store.insert(key, value).unwrap();
                     Response::Ok
                 }
                 Command::Update(key, value) => {
                     let mut store = db.lock().unwrap();
-                    store.update(&key, &value).unwrap();
+                    store.update(key, value).unwrap();
                     Response::Ok
                 }
                 _ => NotSupported,
@@ -52,13 +53,13 @@ async fn handle_client(mut stream: TcpStream, db: Arc<Mutex<Storage>>) {
                 Response::Found(v) => stream.write_all(format!("{}\n", String::from_utf8_lossy(&v)).as_bytes()).await,
                 Response::NotFound(key) => stream.write_all(format!("{} not found\n", String::from_utf8_lossy(&key)).as_bytes()).await,
                 Response::NotSupported => stream.write_all(format!("{}\n", "Supported commands: get, insert, update, delete").as_bytes()).await
-            };
+            }.unwrap_or_else(|e| error!("Error occurred {}", e));
             data.clear();
             true
         }
         Err(_) => {
             println!("An error occurred, terminating connection with {}", stream.get_ref().peer_addr().unwrap());
-            stream.get_mut().shutdown().await;
+            stream.get_mut().shutdown().await.expect("Can't terminate server");
             false
         }
     } {}
@@ -69,7 +70,7 @@ async fn main() {
     log4rs::init_file("config/log4rs.yaml", Default::default()).unwrap();
     let listener = TcpListener::bind("0.0.0.0:3333").await.unwrap();
     let config = Config::new().unwrap();
-    let store = Storage::open(config).expect("unable open file");
+    let store = LsmStorage::load(config).expect("unable run storage");
     let db = Arc::new(Mutex::new(store));
     // accept connections and process them, spawning a new thread for each one
     info!("Server listening on port 3333");
