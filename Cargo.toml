@@ -1,5 +1,5 @@
 [package]
-name = "actionkv"
+name = "lsm_storage_engine"
 version = "0.1.0"
 authors = ["Myroslav Lisniak <myroslav.lisniak@gmail.com>"]
 edition = "2018"
@@ -7,6 +7,9 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+rand = "0.8.4"
+sha2 = "0.10.1"
+base64 = "0.13.0"
 byteorder = "1.2"
 crc = "1.7"
 serde = "1.0.130"
@@ -18,12 +21,13 @@ config = "0.11.0"
 log = "0.4.14"
 log4rs = "1.0.0"
 tokio = { version = "1", features = ["full"] }
+probabilistic-collections = { version = "0.7.0", features = ["serde"] }
 
 [lib]
-name = "libactionkv"
+name = "storage_engine"
 path = "src/lib.rs"
 
 
 [[bin]]
-name = "akv_network"
-path = "src/akv_network.rs"
+name = "network_server"
+path = "src/server.rs"
