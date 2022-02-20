@@ -6,9 +6,7 @@ use std::io::{Read, Write};
 use std::path::{PathBuf};
 use crate::ByteStr;
 
-
-use crate::wal::CommandLog;
-use crate::wal::LogRecord;
+use crate::wal::{CommandLog, LogRecord, WalError};
 
 pub type ByteString = Vec<u8>;
 
@@ -63,7 +61,8 @@ impl<T: Read + Write> MemTable<T> {
     pub fn insert(&mut self, key: ByteString, val: ByteString) -> Option<ByteString> {
         let key_len = key.len();
         let val_len = val.len();
-        self.wal.insert(&key, &val).expect("Can't write insert to WAL log");
+        self.wal.insert(&key, &val)
+            .expect("Can't write insert command to WAL log");
         let prev = self.data.insert(key, val);
         let prev_val_size = prev.as_ref().map(|v| v.len() + key_len).unwrap_or(0);
         self.bytes = self.bytes + key_len + val_len - prev_val_size;
@@ -71,7 +70,8 @@ impl<T: Read + Write> MemTable<T> {
     }
 
     pub fn remove(&mut self, key: &ByteStr) -> Option<ByteString> {
-        self.wal.remove(key).expect("Can't write remove to WAL log");
+        self.wal.remove(key)
+            .expect("Can't write remove command to WAL log");
         let prev = self.data.remove(key);
         let prev_size = prev.as_ref().map(|v| v.len() + key.len()).unwrap_or(0);
         self.bytes -= prev_size;
@@ -86,11 +86,10 @@ impl<T: Read + Write> MemTable<T> {
         self.bytes
     }
 
-
 }
 
 impl<T: Read + Write> TryFrom<CommandLog<T>> for MemTable<T> {
-    type Error = io::Error;
+    type Error = WalError;
 
     fn try_from(mut wal: CommandLog<T>) -> Result<Self, Self::Error> {
         let mut data = BTreeMap::new();
@@ -141,7 +140,7 @@ mod tests {
         }
     }
     #[test]
-    fn restore_from_log() -> io::Result<()> {
+    fn restore_from_log() {
         let mut log: CommandLog<Cursor<Vec<u8>>> = CommandLog::new_in_memory(Vec::new());
         let records = vec![
             LogRecord::Insert("key".as_bytes().to_vec(), "value".as_bytes().to_vec()),
@@ -156,13 +155,12 @@ mod tests {
         let vec = log.inner();
         let log = CommandLog::new_in_memory(vec);
 
-        let table = MemTable::try_from(log)?;
+        let table = MemTable::try_from(log).unwrap();
         assert_eq!(table.get("key1".as_bytes().to_vec().as_ref()), Some("value1".as_bytes().to_vec().as_ref()));
-        Ok(())
     }
 
     #[test]
-    fn size_after_insert() -> io::Result<()> {
+    fn size_after_insert() {
         let mut table: MemTable<InMemoryFile> = MemTable::new_in_memory_log();
         table.insert("key".as_bytes().to_vec(), "value".as_bytes().to_vec());
         assert_eq!(8, table.size_in_bytes());
@@ -172,6 +170,5 @@ mod tests {
         assert_eq!(4, table.size_in_bytes());
         table.remove(&"key".as_bytes().to_vec());
         assert_eq!(0, table.size_in_bytes());
-        Ok(())
     }
 }

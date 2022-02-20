@@ -1,16 +1,30 @@
 use std::{fs, io};
 use std::convert::TryFrom;
 use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, ErrorKind, Read, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use crc::crc32;
+use thiserror::Error;
+
 
 use crate::ByteStr;
 use crate::memtable::ByteString;
 
-//TODO Error handling
+#[derive(Error, Debug)]
+pub enum WalError {
+    #[error("invalid command type: {0}")]
+    InvalidCommandType (u8),
+    #[error("data corruption encountered ({checksum:08x}) != {expected:08x}")]
+    CorruptedData {
+        checksum: u32,
+        expected: u32,
+    },
+    #[error(transparent)]
+    IoError(#[from] io::Error)
+}
+
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 enum CommandType {
     Insert = 1,
@@ -18,13 +32,12 @@ enum CommandType {
 }
 
 impl TryFrom<u8> for CommandType {
-    type Error = io::Error;
+    type Error = WalError;
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             1 => Ok(CommandType::Insert),
             2 => Ok(CommandType::Remove),
-            //TODO: proper error handling
-            _ => Err(io::Error::from_raw_os_error(1))
+            type_code => Err(WalError::InvalidCommandType(type_code ))
         }
     }
 }
@@ -59,17 +72,20 @@ impl<T: Read + Write> Read for CommandLog<T> {
 }
 
 impl<T: Read + Write> Iterator for &mut CommandLog<T> {
-    type Item = Result<LogRecord, io::Error>;
+    type Item = Result<LogRecord, WalError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let result = self.next_record();
         match result {
             Ok(record) => Some(Ok(record)),
-            Err(err) => match err.kind() {
-                io::ErrorKind::UnexpectedEof => {
-                    None
-                }
-                _ => Some(Err(err)),
+            Err(wal_err) => match wal_err {
+                WalError::IoError(ref err) =>  match err.kind() {
+                    io::ErrorKind::UnexpectedEof => {
+                        None
+                    }
+                    _ => Some(Err(wal_err)),
+                },
+                _ => Some(Err(wal_err))
             }
         }
     }
@@ -98,6 +114,7 @@ impl CommandLog<File> {
         }
     }
 }
+
 impl<T: Read + Write> CommandLog<T> {
     pub fn insert(&mut self, key: &ByteStr, val: &ByteStr) -> io::Result<usize> {
         let record = LogRecord::Insert(key.to_vec(), val.to_vec());
@@ -109,8 +126,7 @@ impl<T: Read + Write> CommandLog<T> {
         self.log(&record)
     }
 
-    fn next_record(&mut self) -> io::Result<LogRecord> {
-        // let mut f = BufReader::new(self);
+    fn next_record(&mut self) -> Result<LogRecord, WalError> {
         let command: CommandType = CommandType::try_from(self.read_u8()?)?;
         let saved_checksum = self.read_u32::<LittleEndian>()?;
         match command {
@@ -126,7 +142,7 @@ impl<T: Read + Write> CommandLog<T> {
                 debug_assert_eq!(data.len(), data_len as usize);
                 let checksum = crc::crc32::checksum_ieee(&data);
                 if checksum != saved_checksum {
-                    return Err(io::Error::new(ErrorKind::InvalidData, format!("data corruption encountered ({:08x}) != {:08x}", checksum, saved_checksum)));
+                    return Err( WalError::CorruptedData {checksum, expected: saved_checksum});
                 }
                 let val = data.split_off(key_len as usize);
                 let key = data;
