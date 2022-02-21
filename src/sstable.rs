@@ -95,13 +95,13 @@ impl SsTableMetadata {
         self.construct_path(&self.bloom_filter_filename)
     }
 
-    pub fn load(metadata_path: &Path) -> io::Result<SsTableMetadata> {
+    pub fn load(metadata_path: &Path) -> SsTableMetadata {
         let metadata_file = OpenOptions::new()
             .read(true)
             .open(metadata_path)
             .expect("Can't open metadata file");
         serde_json::from_reader(metadata_file)
-            .map_err(io::Error::from)
+            .expect("Can't read metadata file, file with unknown format")
     }
 }
 
@@ -117,7 +117,7 @@ impl Clone for SsTable<File> {
     fn clone(&self) -> Self {
         let metadata = self.metadata.clone();
         SsTable::load(&metadata.metadata_path())
-            .expect("Can't clone sstable")
+            .expect("Can't load sstable file")
     }
 }
 
@@ -168,15 +168,12 @@ impl<'a, T: Seek + Read> Iterator for Iter<'a, T> {
 
     fn next(&mut self) -> Option<Self::Item> {
         match self.table.read_record(self.pos) {
-            Ok((kv_pair, len)) => {
+            Ok(Some((kv_pair, len))) => {
                 self.pos += len;
                 Some(kv_pair)
-            }
-            Err(err) =>
-                match err.kind() {
-                    io::ErrorKind::UnexpectedEof => None,
-                    _ => panic!("Unexpected error occurred. Err: {}", err)
-                }
+            },
+            Ok(None) => None,
+            Err(err) => panic!("Unexpected error occurred. Err: {}", err)
         }
     }
 }
@@ -193,43 +190,53 @@ impl<T: Seek + Read> SsTable<T> {
         match self.index.get(key) {
             Some(pos) => {
                 let position = *pos;
-                let (record, _) = self.read_record(position)?;
-                Ok(Some(record.value))
+                self.read_record(position)
+                    .map(|op| op.map(|p| p.0.value))
             }
             None => {
-                let mut range: Range<ByteString, u64> = self.index.range::<ByteString, _>(..key.to_vec());
-                if let Some((_, start)) = range.next_back() {
-                    let mut pos = *start;
-                    let mut range: Range<ByteString, u64> = self.index.range::<ByteString, _>(key.to_vec()..);
-                    let end = range.next().map(|e| *e.1);
-                    loop {
-                        match self.read_record(pos) {
-                            Ok((kv, len)) => if kv.key == *key {
-                                return Ok(Some(kv.value));
-                            } else {
-                                pos += len;
-                            },
-                            Err(err) =>
-                                match err.kind() {
-                                    io::ErrorKind::UnexpectedEof => {
-                                        break;
-                                    }
-                                    _ => return Err(err)
-                                }
-                        }
-                        if let Some(e) = end {
-                            if pos >= e {
-                                break;
-                            }
-                        }
-                    }
-                }
-                Ok(None)
+                let (start, end) = self.position_range(key);
+                self.scan_range(key, start, end)
             }
         }
     }
 
-    fn read_record(&mut self, pos: u64) -> io::Result<(KeyValuePair, u64)> {
+    fn position_range(&self, key: &ByteStr) -> (u64, u64) {
+        let mut range: Range<ByteString, u64> = self.index.range::<ByteString, _>(..key.to_vec());
+        let start = range.next_back().map(|r| *r.1).unwrap_or(0);
+        let mut range: Range<ByteString, u64> = self.index.range::<ByteString, _>(key.to_vec()..);
+        let end = range.next().map(|e| *e.1).unwrap_or(self.size_bytes);
+        (start, end)
+    }
+
+    fn scan_range(&mut self, key: &ByteStr, start: u64, end: u64) -> io::Result<Option<ByteString>> {
+        let mut pos = start;
+        loop {
+            match self.read_record(pos)? {
+                Some((kv, len)) => if kv.key == *key {
+                    return Ok(Some(kv.value));
+                } else {
+                    pos += len;
+                    if pos >= end {
+                        break;
+                    }
+                },
+                None => break
+            }
+        }
+        Ok(None)
+    }
+
+    fn read_record(&mut self, pos: u64) -> io::Result<Option<(KeyValuePair, u64)>> {
+        match self.read_record_unsafe(pos) {
+            Ok(res) => Ok(Some(res)),
+            Err(err) => match err.kind() {
+                io::ErrorKind::UnexpectedEof => Ok(None),
+                _ => Err(err)
+            }
+        }
+    }
+
+    fn read_record_unsafe(&mut self, pos: u64) -> io::Result<(KeyValuePair, u64)> {
         let seek_from = SeekFrom::Start(pos);
         self.data.seek(seek_from)?;
         let key_len = self.data.read_u32::<LittleEndian>()?;
@@ -248,7 +255,7 @@ impl<T: Seek + Read> SsTable<T> {
 
 impl SsTable<File> {
     pub fn load(metadata_path: &Path) -> io::Result<SsTable<File>> {
-        let metadata = SsTableMetadata::load(metadata_path)?;
+        let metadata = SsTableMetadata::load(metadata_path);
         let calculated_data_hash = SsTable::calculate_checksum(&metadata.data_path())?;
         let calculated_index_hash = SsTable::calculate_checksum(&metadata.index_path())?;
         let checksum_file = OpenOptions::new()

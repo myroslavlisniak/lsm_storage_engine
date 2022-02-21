@@ -22,6 +22,7 @@ log = "0.4.14"
 log4rs = "1.0.0"
 tokio = { version = "1", features = ["full"] }
 probabilistic-collections = { version = "0.7.0", features = ["serde"] }
+thiserror = "1.0.30"
 
 [lib]
 name = "storage_engine"
