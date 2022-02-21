@@ -54,7 +54,8 @@ impl LsmStorage {
         fs::create_dir_all(&wal_path)?;
         wal_path.push("wal.log");
         let memtable = match CommandLog::new(wal_path) {
-            Ok(log) => MemTable::try_from(log)?,
+            Ok(log) => MemTable::try_from(log)
+                .expect("Can't restore memtable from wal log"),
             Err(err) => {
                 warn!("Can't load wal log, {}", err);
                 MemTable::new(&config.base_path)
