@@ -93,6 +93,7 @@ impl<T: Read + Write> Iterator for &mut CommandLog<T> {
 
 impl CommandLog<File> {
     pub fn new(path: PathBuf) -> io::Result<CommandLog<File>> {
+        fs::create_dir_all(&path.parent().unwrap())?;
         // let path = PathBuf::from("./wal.log");
         let mut new_file = OpenOptions::new()
             .read(true)

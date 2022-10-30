@@ -210,17 +210,14 @@ impl<T: Seek + Read> SsTable<T> {
 
     fn scan_range(&mut self, key: &ByteStr, start: u64, end: u64) -> io::Result<Option<ByteString>> {
         let mut pos = start;
-        loop {
-            match self.read_record(pos)? {
-                Some((kv, len)) => if kv.key == *key {
-                    return Ok(Some(kv.value));
-                } else {
-                    pos += len;
-                    if pos >= end {
-                        break;
-                    }
-                },
-                None => break
+        while let Some((kv, len)) = self.read_record(pos)? {
+            if kv.key == *key {
+                return Ok(Some(kv.value));
+            } else {
+                pos += len;
+                if pos >= end {
+                    break;
+                }
             }
         }
         Ok(None)
@@ -230,7 +227,7 @@ impl<T: Seek + Read> SsTable<T> {
         match self.read_record_unsafe(pos) {
             Ok(res) => Ok(Some(res)),
             Err(err) => match err.kind() {
-                io::ErrorKind::UnexpectedEof => Ok(None),
+                ErrorKind::UnexpectedEof => Ok(None),
                 _ => Err(err)
             }
         }
@@ -296,7 +293,7 @@ impl SsTable<File> {
         })
     }
 
-    pub fn from_memtable<Log: Read + Write>(base_path: &str, memtable: &MemTable<Log>) -> io::Result<SsTable<File>> {
+    pub fn from_memtable(base_path: &str, memtable: &MemTable) -> io::Result<SsTable<File>> {
         let metadata = SsTableMetadata::new(base_path.to_string(), 0);
         let (data_file, index, bloom_filter, size) =
             SsTable::write_data_file(&metadata, memtable)?;
@@ -345,7 +342,7 @@ impl SsTable<File> {
                                 current_idx = Some(i);
                             }
                             if values[curr].as_ref().unwrap().key == kv.key {
-                                values[curr] = (&mut iterators[curr]).next()
+                                values[curr] = iterators[curr].next()
                             }
                         }
                     }
@@ -364,7 +361,7 @@ impl SsTable<File> {
                     counter += 1;
                     pos += diff;
                     bloom_filter.insert(&kv.key);
-                    values[idx] = (&mut iterators[idx]).next();
+                    values[idx] = iterators[idx].next();
                 }
                 None => break
             }
@@ -396,7 +393,7 @@ impl SsTable<File> {
         fs::remove_file(self.metadata.data_path())
     }
 
-    fn write_data_file<Log: Read + Write>(metadata: &SsTableMetadata, memtable: &MemTable<Log>) -> io::Result<(File, SstableIndex, SstableBloomFilter, u64)> {
+    fn write_data_file(metadata: &SsTableMetadata, memtable: &MemTable) -> io::Result<(File, SstableIndex, SstableBloomFilter, u64)> {
         let mut data_file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -428,8 +425,8 @@ impl SsTable<File> {
         let val_len = val.len() as u32;
         data_file.write_u32::<LittleEndian>(key_len)?;
         data_file.write_u32::<LittleEndian>(val_len)?;
-        data_file.write_all(&key)?;
-        data_file.write_all(&val)?;
+        data_file.write_all(key)?;
+        data_file.write_all(val)?;
         Ok(u64::from(8 + key_len + val_len))
     }
 
@@ -501,6 +498,8 @@ impl SsTable<File> {
 #[cfg(test)]
 mod tests {
     use std::{env, fs};
+    use std::fs::File;
+    use serial_test::serial;
 
     use crate::memtable::MemTable;
     use crate::sstable::SsTable;
@@ -514,12 +513,13 @@ mod tests {
         for i in 0..5 {
             let mut path_buf = buf.clone();
             path_buf.push(format!("level-{}", i));
-            std::fs::create_dir_all(&path_buf).unwrap();
+            fs::create_dir_all(&path_buf).unwrap();
         }
         base_dir.to_string()
     }
 
     #[test]
+    #[serial]
     fn sstable_test() {
         let base_dir = prepare_directories();
         let mut memtable = MemTable::new_in_memory_log();
@@ -528,15 +528,12 @@ mod tests {
             memtable.insert(i.to_string().into_bytes(), val.to_string().into_bytes());
         }
         let mut sstable = SsTable::from_memtable(&base_dir, &memtable).unwrap();
-        for i in 0..500 {
-            let val = sstable.get(&i.to_string().into_bytes()).unwrap();
-            assert_eq!(true, val.is_some());
-            assert_eq!((i * 100).to_string().into_bytes(), val.unwrap());
-        }
+        check_values(&mut sstable);
         assert_eq!(None, sstable.get(&"1000".to_string().into_bytes()).unwrap());
     }
 
     #[test]
+    #[serial]
     fn sstable_iterator_test() {
         let base_dir = prepare_directories();
         let mut memtable = MemTable::new_in_memory_log();
@@ -559,6 +556,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn sstable_load_from_file_test() {
         let base_dir = prepare_directories();
         let mut memtable = MemTable::new_in_memory_log();
@@ -568,6 +566,10 @@ mod tests {
         }
         let sstable = SsTable::from_memtable(&base_dir, &memtable).unwrap();
         let mut sstable = SsTable::load(&sstable.metadata.metadata_path()).unwrap();
+        check_values(&mut sstable)
+    }
+
+    fn check_values(sstable: &mut SsTable<File>) {
         for i in 0..500 {
             let val = sstable.get(&i.to_string().into_bytes()).unwrap();
             assert_eq!(true, val.is_some());
