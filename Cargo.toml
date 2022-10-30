@@ -32,3 +32,6 @@ path = "src/lib.rs"
 [[bin]]
 name = "network_server"
 path = "src/server.rs"
+
+[dev-dependencies]
+serial_test = "*"

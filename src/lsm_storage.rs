@@ -3,7 +3,7 @@ use std::convert::TryFrom;
 use std::fs::File;
 use std::path::PathBuf;
 
-use log::{debug, warn};
+use log::{debug};
 
 use crate::{ByteStr, ByteString};
 use crate::config::Config;
@@ -21,7 +21,8 @@ pub struct KeyValuePair {
 
 pub struct LsmStorage {
     config: Config,
-    memtable: MemTable<File>,
+    wal: CommandLog<File>,
+    memtable: MemTable,
     sstables: Vec<Vec<SsTable<File>>>,
 }
 
@@ -49,20 +50,13 @@ impl LsmStorage {
             tables.sort();
             levels.push(tables);
         }
-        let mut wal_path = path;
-        wal_path.push("wal");
-        fs::create_dir_all(&wal_path)?;
-        wal_path.push("wal.log");
-        let memtable = match CommandLog::new(wal_path) {
-            Ok(log) => MemTable::try_from(log)
-                .expect("Can't restore memtable from wal log"),
-            Err(err) => {
-                warn!("Can't load wal log, {}", err);
-                MemTable::new(&config.base_path)
-            }
-        };
+        let wal_path = LsmStorage::wal_path(&config.base_path);
+        let mut command_log = CommandLog::new(wal_path)?;
+        let memtable = MemTable::from_log(&mut command_log)
+            .expect("Can't restore memtable from a log");
         Ok(LsmStorage {
             config,
+            wal: command_log,
             memtable,
             sstables: levels,
         })
@@ -70,17 +64,27 @@ impl LsmStorage {
 
     pub fn insert(&mut self, key: ByteString, value: ByteString) -> io::Result<()> {
         debug!("Inserting key: {:?} ", key);
+        self.wal.insert(&key, &value).expect("Can't write command to WAL log");
         self.memtable.insert(key, value);
         if self.memtable.size_in_bytes() >= self.config.memtable_limit_bytes {
             debug!("Memtable is too big, creating new sstable");
-            let sstable: SsTable<File> = SsTable::from_memtable(&self.config.base_path, &self.memtable).expect("Can't create new sstable");
-            self.memtable.close().expect("Can't remove old wal log");
+            let sstable: SsTable<File> = SsTable::from_memtable(&self.config.base_path, &self.memtable)
+                .expect("Can't create new sstable");
+            self.wal.close().expect("Can't remove old wal log");
             self.sstables[0].push(sstable);
-            self.memtable = MemTable::new(&self.config.base_path);
+            self.wal = CommandLog::new(LsmStorage::wal_path(&self.config.base_path))
+                .expect("Can't create WAL file");
+            self.memtable = MemTable::new();
             self.compact()?;
         }
 
         Ok(())
+    }
+    fn wal_path(base_path: &str) -> PathBuf {
+        let mut  wal_path = PathBuf::from(base_path);
+        wal_path.push("wal");
+        wal_path.push("wal.log");
+        wal_path
     }
 
     pub fn get(&mut self, key: &ByteStr) -> io::Result<Option<ByteString>> {
@@ -98,7 +102,7 @@ impl LsmStorage {
 
     fn get_internal(&mut self, key: &ByteStr) -> io::Result<Option<ByteString>> {
         // let key_owned = key.to_vec();
-        match self.memtable.get(&key) {
+        match self.memtable.get(key) {
             Some(val) => {
                 debug!("Key: {:?} found in memtable", key);
                 return Ok(Some(val.to_owned()));
@@ -107,7 +111,7 @@ impl LsmStorage {
                 for i in 0..SSTABLE_MAX_LEVEL {
                     let level = &mut self.sstables[i];
                     for sstable in level.iter_mut().rev() {
-                        if let Some(val) = sstable.get(&key)? {
+                        if let Some(val) = sstable.get(key)? {
                             debug!("Key: {:?} found in level {}, sstable: {}", key, i, sstable.id());
                             return Ok(Some(val));
                         }
@@ -126,7 +130,9 @@ impl LsmStorage {
 
     #[inline]
     pub fn delete(&mut self, key: &ByteStr) -> io::Result<()> {
-        self.insert(key.to_vec(), vec![0])
+        self.wal.remove(key).expect("Can't write command to WAL log");
+        self.memtable.insert(key.to_vec(), vec![0]);
+        Ok(())
     }
 
     fn compact(&mut self) -> io::Result<()> {
@@ -154,18 +160,25 @@ mod tests {
     use std::collections::HashMap;
 
     use rand::Rng;
+    use serial_test::serial;
 
     use crate::config::Config;
     use crate::lsm_storage::LsmStorage;
 
-    #[test]
-    fn storage_insert_test() -> io::Result<()> {
-
+    fn prepare_directories() -> String{
         let mut buf = env::temp_dir();
         buf.push("storage_test");
         let base_dir = buf.to_str().expect("Can't get temp directory");
         fs::remove_dir_all(base_dir).unwrap_or(());
-        fs::create_dir_all(base_dir)?;
+        fs::create_dir_all(base_dir).unwrap();
+        base_dir.to_string()
+    }
+
+    #[test]
+    #[serial]
+    fn storage_insert_test() -> io::Result<()> {
+        let base_dir = prepare_directories();
+
         let config = Config {
             base_path: base_dir.to_string(),
             memtable_limit_bytes: 4096,
@@ -184,15 +197,12 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn storage_compact_test() -> io::Result<()> {
         let mut rng = rand::thread_rng();
 
         let mut hash_map = HashMap::new();
-        let mut buf = env::temp_dir();
-        buf.push("storage_test");
-        let base_dir = buf.to_str().expect("Can't get temp directory");
-        fs::remove_dir_all(base_dir).unwrap_or(());
-        fs::create_dir_all(base_dir)?;
+        let base_dir = prepare_directories();
         let config = Config {
             base_path: base_dir.to_string(),
             memtable_limit_bytes: 4096,
