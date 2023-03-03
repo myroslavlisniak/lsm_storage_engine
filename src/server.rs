@@ -9,13 +9,13 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
 use command::{Command, Response};
-use command::Response::{Found, NotFound, NotSupported};
 use storage_engine::config::Config;
 use storage_engine::LsmStorage;
+use storage_engine::Db;
 
 mod command;
 
-async fn handle_client(stream: TcpStream, db: Arc<Mutex<LsmStorage>>) {
+async fn handle_client(stream: TcpStream, db: Db) {
     let mut stream = BufReader::new(stream);
     let mut data = String::new();
 
@@ -25,28 +25,24 @@ async fn handle_client(stream: TcpStream, db: Arc<Mutex<LsmStorage>>) {
 
             let result = match cmd {
                 Command::Get(key) => {
-                    let mut store = db.lock().unwrap();
-                    match store.get(&key).unwrap() {
-                        None => NotFound(key),
-                        Some(value) => Found(value),
+                    match db.get(&key).await.unwrap() {
+                        None => Response::NotFound(key),
+                        Some(value) => Response::Found(value),
                     }
                 }
                 Command::Delete(key) => {
-                    let mut store = db.lock().unwrap();
-                    store.delete(&key).unwrap();
+                    db.delete(&key).await.unwrap();
                     Response::Ok
                 }
                 Command::Insert(key, value) => {
-                    let mut store = db.lock().unwrap();
-                    store.insert(key, value).unwrap();
+                    db.insert(key, value).await.unwrap();
                     Response::Ok
                 }
                 Command::Update(key, value) => {
-                    let mut store = db.lock().unwrap();
-                    store.update(key, value).unwrap();
+                    db.update(key, value).await.unwrap();
                     Response::Ok
                 }
-                _ => NotSupported,
+                _ => Response::NotSupported,
             };
             match result {
                 Response::Ok => stream.write_all("ok\n".as_bytes()).await,
@@ -70,8 +66,16 @@ async fn main() {
     log4rs::init_file("config/log4rs.yaml", Default::default()).unwrap();
     let listener = TcpListener::bind("0.0.0.0:3333").await.unwrap();
     let config = Config::new().unwrap();
-    let store = LsmStorage::load(config).expect("unable run storage");
-    let db = Arc::new(Mutex::new(store));
+    let db = Db::load(config).expect("unable run storage");
+    let db_clone = db.clone();
+    tokio::task::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(1000));
+        loop {
+            interval.tick().await;
+            db_clone.compact().await.expect("Compact failed");
+        }
+    });
+
     // accept connections and process them, spawning a new thread for each one
     info!("Server listening on port 3333");
     loop {

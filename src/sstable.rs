@@ -2,8 +2,7 @@ extern crate probabilistic_collections;
 
 use std::{fs, io};
 use std::cmp::Ordering;
-use std::collections::btree_map::Range;
-use std::collections::BTreeMap;
+use std::collections::btree_map::{BTreeMap, Range};
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -22,8 +21,8 @@ use crate::memtable::{ByteString, MemTable};
 
 const INDEX_STEP: usize = 100;
 
-type SstableIndex = BTreeMap<ByteString, u64>;
-type SstableBloomFilter = BloomFilter<ByteString>;
+pub type SstableIndex = BTreeMap<ByteString, u64>;
+pub type SstableBloomFilter = BloomFilter<ByteString>;
 
 #[derive(Serialize, Deserialize)]
 struct Checksums {
@@ -75,7 +74,7 @@ impl SsTableMetadata {
         path
     }
 
-    fn data_path(&self) -> PathBuf {
+    pub(crate) fn data_path(&self) -> PathBuf {
         self.construct_path(&self.data_filename)
     }
 

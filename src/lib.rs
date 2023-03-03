@@ -4,6 +4,7 @@ extern crate crc;
 extern crate serde_derive;
 
 pub use lsm_storage::LsmStorage;
+pub use db::Db;
 
 pub type ByteString = Vec<u8>;
 pub type ByteStr = [u8];
@@ -13,3 +14,4 @@ mod memtable;
 mod wal;
 mod sstable;
 mod lsm_storage;
+mod db;
