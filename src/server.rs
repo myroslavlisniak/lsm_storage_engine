@@ -53,8 +53,8 @@ async fn handle_client(stream: TcpStream, db: Db) {
             data.clear();
             true
         }
-        Err(_) => {
-            println!("An error occurred, terminating connection with {}", stream.get_ref().peer_addr().unwrap());
+        Err(err) => {
+            println!("An error occurred, terminating connection with {}, {}", stream.get_ref().peer_addr().unwrap(), err);
             stream.get_mut().shutdown().await.expect("Can't terminate server");
             false
         }
@@ -69,7 +69,7 @@ async fn main() {
     let db = Db::load(config).expect("unable run storage");
     let db_clone = db.clone();
     tokio::task::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(1000));
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(10000));
         loop {
             interval.tick().await;
             db_clone.compact().await.expect("Compact failed");

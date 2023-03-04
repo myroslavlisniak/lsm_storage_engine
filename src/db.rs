@@ -7,10 +7,10 @@ use std::convert::TryFrom;
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::mem::take;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc};
 use std::time::{SystemTime, UNIX_EPOCH};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use log::debug;
+use log::{debug, info};
 use probabilistic_collections::bloom::BloomFilter;
 use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
@@ -22,6 +22,8 @@ use crate::sstable::{SstableBloomFilter, SstableIndex};
 use crate::wal::CommandLog;
 use serde::{Deserialize, Serialize};
 use base64::encode as base64_encode;
+use parking_lot::{RwLock, Mutex};
+use parking_lot::lock_api::RwLockUpgradableReadGuard;
 
 const SSTABLE_MAX_LEVEL: usize = 5;
 const INDEX_STEP: usize = 100;
@@ -37,7 +39,6 @@ struct State {
     old_memtable: RwLock<Option<Arc<MemTable>>>,
     wal: RwLock<CommandLog<File>>,
     levels: RwLock<SsLevelTable>,
-    compact_notify: Notify,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -115,7 +116,6 @@ impl Db {
                 levels: RwLock::new(SsLevelTable {
                     levels,
                 }),
-                compact_notify: Default::default(),
             }),
         })
     }
@@ -128,17 +128,17 @@ impl Db {
     //TODO make it await wal insert
     pub async fn insert(&self, key: ByteString, value: ByteString) -> io::Result<()> {
         {
-            let mut wal = self.state.wal.write().unwrap();
+            let mut wal = self.state.wal.write();
             wal.insert(&key, &value)?;
         }
         let mut old_clone = None;
         let mut size = 0;
         {
-            let mut memtable = self.state.memtable.write().unwrap();
+            let mut memtable = self.state.memtable.write();
             memtable.insert(key, value);
             size = memtable.size_in_bytes();
             if size > self.state.config.memtable_limit_bytes {
-                let mut old = self.state.old_memtable.write().unwrap();
+                let mut old = self.state.old_memtable.write();
                 if old.is_none() {
                     let old_table = mem::replace(&mut *memtable, MemTable::new());
                     let arc = Arc::new(old_table);
@@ -154,17 +154,17 @@ impl Db {
                 let sstable: SsTable = SsTable::from_memtable(&state.config.base_path, &old_clone.unwrap())
                     .expect("Can't create new sstable");
                 {
-                    let mut levels = state.levels.write().unwrap();
+                    let mut levels = state.levels.write();
                     (*levels).levels[0].push(sstable);
                 }
                 {
-                    let mut wal = state.wal.write().unwrap();
+                    let mut wal = state.wal.write();
                     wal.close().expect("Can't remove old wal log");
                     *wal = CommandLog::new(Self::wal_path(&state.config.base_path))
                         .expect("Can't create WAL file");
                 }
                 {
-                    let mut old = state.old_memtable.write().unwrap();
+                    let mut old = state.old_memtable.write();
                     *old = None
                 }
             });
@@ -180,11 +180,11 @@ impl Db {
     #[inline]
     pub async fn delete(&self, key: &ByteStr) -> io::Result<()> {
         {
-            let mut wal = self.state.wal.write().unwrap();
+            let mut wal = self.state.wal.write();
             wal.remove(&key)?;
         }
         {
-            let mut memtable = self.state.memtable.write().unwrap();
+            let mut memtable = self.state.memtable.write();
             memtable.insert(key.to_vec(), vec![0]);
         }
         Ok(())
@@ -204,7 +204,7 @@ impl Db {
     async fn get_internal(&self, key: &ByteStr) -> io::Result<Option<ByteString>> {
         // let key_owned = key.to_vec();
         {
-            let memtable = self.state.memtable.read().unwrap();
+            let memtable = self.state.memtable.read();
             let result = memtable.get(key);
             if let Some(val) = result {
                 debug!("Key: {:?} found in memtable", key);
@@ -212,7 +212,7 @@ impl Db {
             }
         }
         {
-            let old_memtable = self.state.old_memtable.read().unwrap();
+            let old_memtable = self.state.old_memtable.read();
             let result = old_memtable.as_ref().and_then(|m| m.get(key));
             if let Some(val) = result {
                 debug!("Key: {:?} found in memtable", key);
@@ -222,7 +222,7 @@ impl Db {
         let state = self.state.clone();
         let key = key.to_owned();
         let result = tokio::task::spawn_blocking(move || {
-            let levels = state.levels.read().unwrap();
+            let levels = state.levels.read();
             for i in 0..SSTABLE_MAX_LEVEL {
                 for sstable in levels.levels[i].iter().rev() {
                     if let Some(val) = sstable.get(&key)? {
@@ -240,42 +240,42 @@ impl Db {
     }
 
     pub async fn compact(&self) -> io::Result<()> {
-        let mut new_levels: Vec<Vec<SsTable>> = Vec::new();
-        for _ in 0..SSTABLE_MAX_LEVEL {
-            new_levels.push(Vec::new());
-        }
-        {
-            let levels = self.state.levels.read().unwrap();
-            for i in 0..SSTABLE_MAX_LEVEL - 1 {
-                if levels.levels[i].len() >= self.state.config.sstable_level_limit {
-                    let new_sstable = SsTable::merge_compact(&levels.levels[i], u8::try_from(i + 1).unwrap(), &self.state.config.base_path)?;
-                    new_levels[i + 1].push(new_sstable);
-                    // FIXME
-                    for table in &levels.levels[i] {
-                        table.close()?;
-                    }
-                } else {
-                    new_levels[i] = levels.levels[i].clone();
-                }
+        let db = self.clone();
+        tokio::task::spawn_blocking(move || {
+            info!("Compaction started");
+            let mut new_levels: Vec<Vec<SsTable>> = Vec::new();
+            for _ in 0..SSTABLE_MAX_LEVEL {
+                new_levels.push(Vec::new());
             }
-        }
-        {
-            let mut levels = self.state.levels.write().unwrap();
-            *levels = SsLevelTable{
-                levels: new_levels
-            };
-        }
+            {
+                let levels = db.state.levels.upgradable_read();
+                for i in 0..SSTABLE_MAX_LEVEL - 1 {
+                    if levels.levels[i].len() >= db.state.config.sstable_level_limit {
+                        info!("Compaction on level {}", i);
+                        let new_sstable = SsTable::merge_compact(&levels.levels[i], u8::try_from(i + 1).unwrap(), &db.state.config.base_path)?;
+                        new_levels[i + 1].push(new_sstable);
+                        // FIXME
+                        for table in &levels.levels[i] {
+                            table.close()?;
+                        }
+                    } else {
+                        for j in 0..levels.levels[i].len() {
+                            new_levels[i].push(levels.levels[i][j].clone());
+                        }
+                        // new_levels[i] = levels.levels[i].clone();
+                    }
+                }
+                let mut levels = RwLockUpgradableReadGuard::upgrade(levels);
+                *levels = SsLevelTable {
+                    levels: new_levels
+                };
+            }
+            info!("Compaction finished");
+            Ok(())
+        }).await?
 
-        Ok(())
     }
 
-
-    async fn on_compact_completed(state: Arc<State>) {
-        loop {
-            state.compact_notify.notified().await;
-            // TODO reload all sstables
-        }
-    }
 }
 
 impl SsTable {
@@ -333,7 +333,7 @@ impl SsTable {
         }
         let mut data = None;
         {
-            let mut locked_data = self.data.lock().unwrap().pop_front();
+            let mut locked_data = self.data.lock().pop_front();
             mem::swap(&mut data, &mut locked_data);
         }
         // todo
@@ -350,7 +350,7 @@ impl SsTable {
             }
         };
         {
-            self.data.lock().unwrap().push_back(data);
+            self.data.lock().push_back(data);
         }
         result
     }
@@ -751,5 +751,59 @@ impl SsTableMetadata {
             .expect("Can't open metadata file");
         serde_json::from_reader(metadata_file)
             .expect("Can't read metadata file, file with unknown format")
+    }
+}
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::{env, fs, io};
+    use rand::Rng;
+    use crate::config::Config;
+    use crate::Db;
+
+    fn prepare_directories() -> String{
+        let mut buf = env::temp_dir();
+        buf.push("storage_test");
+        let base_dir = buf.to_str().expect("Can't get temp directory");
+        fs::remove_dir_all(base_dir).unwrap_or(());
+        fs::create_dir_all(base_dir).unwrap();
+        base_dir.to_string()
+    }
+
+    #[tokio::test(flavor ="multi_thread", worker_threads = 8)]
+    // #[serial]
+    async fn storage_compact_test() -> io::Result<()> {
+        let mut rng = rand::thread_rng();
+
+        let mut hash_map = HashMap::new();
+        let base_dir = prepare_directories();
+        let config = Config {
+            base_path: base_dir.to_string(),
+            memtable_limit_bytes: 4096,
+            sstable_level_limit: 4
+        };
+        let mut storage = Db::load(config)?;
+        let db_clone = storage.clone();
+        tokio::task::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(10));
+            loop {
+                interval.tick().await;
+                db_clone.compact().await.expect("Compact failed");
+            }
+        });
+        for _i in 0..100000 {
+            let key: u32 = rng.gen::<u32>() % 500;
+            let key = format!("kt_{}", key).into_bytes();
+            let val = format!("vt_{}", rng.gen::<u32>()).into_bytes();
+            hash_map.insert(key.clone(), val.clone());
+            storage.insert(key.clone(), val.clone()).await.unwrap();
+            let option = storage.get(&key).await.unwrap();
+            assert_eq!(val, option.unwrap());
+        }
+        for (key, val) in &hash_map {
+            assert_eq!(*val, storage.get(key).await.unwrap().unwrap());
+        }
+
+        Ok(())
     }
 }
