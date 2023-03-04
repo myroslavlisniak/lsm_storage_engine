@@ -5,7 +5,6 @@ use std::cmp::Ordering;
 use std::collections::btree_map::{BTreeMap, Range};
 use std::convert::TryFrom;
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
-use std::mem::take;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -13,7 +12,6 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use log::{debug, info};
 use probabilistic_collections::bloom::BloomFilter;
 use sha2::{Digest, Sha256};
-use tokio::sync::Notify;
 use crate::{ByteStr, ByteString};
 use crate::config::Config;
 use crate::lsm_storage::KeyValuePair;
@@ -132,11 +130,10 @@ impl Db {
             wal.insert(&key, &value)?;
         }
         let mut old_clone = None;
-        let mut size = 0;
         {
             let mut memtable = self.state.memtable.write();
             memtable.insert(key, value);
-            size = memtable.size_in_bytes();
+            let size = memtable.size_in_bytes();
             if size > self.state.config.memtable_limit_bytes {
                 let mut old = self.state.old_memtable.write();
                 if old.is_none() {
@@ -155,7 +152,7 @@ impl Db {
                     .expect("Can't create new sstable");
                 {
                     let mut levels = state.levels.write();
-                    (*levels).levels[0].push(sstable);
+                    levels.levels[0].push(sstable);
                 }
                 {
                     let mut wal = state.wal.write();
@@ -181,7 +178,7 @@ impl Db {
     pub async fn delete(&self, key: &ByteStr) -> io::Result<()> {
         {
             let mut wal = self.state.wal.write();
-            wal.remove(&key)?;
+            wal.remove(key)?;
         }
         {
             let mut memtable = self.state.memtable.write();
@@ -475,7 +472,7 @@ impl SsTable {
             sha2::Digest::update(&mut hasher, &buffer[..count]);
         }
         let hash = hasher.finalize();
-        Ok(base64_encode(&hash))
+        Ok(base64_encode(hash))
     }
 
     fn write_key_value(data_file: &mut File, key: &ByteStr, val: &ByteStr) -> io::Result<u64> {

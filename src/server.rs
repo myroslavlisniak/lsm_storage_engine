@@ -2,7 +2,6 @@ extern crate storage_engine;
 extern crate log4rs;
 
 // use std::net::Shutdown;
-use std::sync::{Arc, Mutex};
 
 use log::{error, info};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -10,7 +9,6 @@ use tokio::net::{TcpListener, TcpStream};
 
 use command::{Command, Response};
 use storage_engine::config::Config;
-use storage_engine::LsmStorage;
 use storage_engine::Db;
 
 mod command;

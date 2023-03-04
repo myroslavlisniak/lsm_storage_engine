@@ -462,7 +462,7 @@ impl SsTable<File> {
             sha2::Digest::update(&mut hasher, &buffer[..count]);
         }
         let hash = hasher.finalize();
-        Ok(base64_encode(&hash))
+        Ok(base64_encode(hash))
     }
 
     fn write_index(metadata: &SsTableMetadata, index: &BTreeMap<ByteString, u64>) -> io::Result<()> {
