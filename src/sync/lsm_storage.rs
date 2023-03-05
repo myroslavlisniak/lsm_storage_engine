@@ -7,23 +7,19 @@ use log::{debug};
 
 use crate::{ByteStr, ByteString};
 use crate::config::Config;
+use crate::datafile::DataFile;
 use crate::memtable::MemTable;
-use crate::sstable::SsTable;
+use crate::sync::sstable::SsTable;
 use crate::wal::CommandLog;
 
 const SSTABLE_MAX_LEVEL: usize = 5;
 
-#[derive(Debug)]
-pub struct KeyValuePair {
-    pub key: ByteString,
-    pub value: ByteString,
-}
 
 pub struct LsmStorage {
     config: Config,
     wal: CommandLog<File>,
     memtable: MemTable,
-    sstables: Vec<Vec<SsTable<File>>>,
+    sstables: Vec<Vec<SsTable<DataFile>>>,
 }
 
 impl LsmStorage {
@@ -35,7 +31,7 @@ impl LsmStorage {
             level_path.push(format!("level-{}", i));
             fs::create_dir_all(&level_path)?;
 
-            let mut tables: Vec<SsTable<File>> = Vec::new();
+            let mut tables: Vec<SsTable<DataFile>> = Vec::new();
             let paths = fs::read_dir(level_path)?;
 
             for path in paths {
@@ -68,7 +64,7 @@ impl LsmStorage {
         self.memtable.insert(key, value);
         if self.memtable.size_in_bytes() >= self.config.memtable_limit_bytes {
             debug!("Memtable is too big, creating new sstable");
-            let sstable: SsTable<File> = SsTable::from_memtable(&self.config.base_path, &self.memtable)
+            let sstable: SsTable<DataFile> = SsTable::from_memtable(&self.config.base_path, &self.memtable)
                 .expect("Can't create new sstable");
             self.wal.close().expect("Can't remove old wal log");
             self.sstables[0].push(sstable);
@@ -139,7 +135,7 @@ impl LsmStorage {
         for i in 0..SSTABLE_MAX_LEVEL - 1 {
             if self.sstables[i].len() >= self.config.sstable_level_limit {
                 let new_sstable = SsTable::merge_compact(&mut self.sstables[i], u8::try_from(i + 1).unwrap(), &self.config.base_path)?;
-                self.sstables[i + 1].push(new_sstable);
+                self.sstables[i + 1].push( new_sstable);
                 for table in &self.sstables[i] {
                     table.close()?;
                 }
@@ -163,7 +159,7 @@ mod tests {
     use serial_test::serial;
 
     use crate::config::Config;
-    use crate::lsm_storage::LsmStorage;
+    use crate::LsmStorage;
 
     fn prepare_directories() -> String{
         let mut buf = env::temp_dir();

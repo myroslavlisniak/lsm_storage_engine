@@ -5,8 +5,7 @@ use std::cmp::Ordering;
 use std::collections::btree_map::{BTreeMap, Range};
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::Path;
 
 use base64::encode as base64_encode;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -14,10 +13,11 @@ use log::debug;
 use probabilistic_collections::bloom::BloomFilter;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use crate::ByteStr;
+use crate::{ByteStr, KeyValuePair};
+use crate::datafile::DataFile;
 
-use crate::lsm_storage::KeyValuePair;
 use crate::memtable::{ByteString, MemTable};
+use crate::sstable_metadata::SsTableMetadata;
 
 const INDEX_STEP: usize = 100;
 
@@ -30,79 +30,7 @@ struct Checksums {
     data_checksum: String,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
-pub struct SsTableMetadata {
-    base_path: String,
-    id: u128,
-    level: u8,
-    metadata_filename: String,
-    checksum_filename: String,
-    data_filename: String,
-    index_filename: String,
-    bloom_filter_filename: String,
-}
 
-
-impl SsTableMetadata {
-    pub fn new(base_path: String, level: u8) -> SsTableMetadata {
-        let start = SystemTime::now();
-        let since_the_epoch = start
-            .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards");
-
-        let timestamp = since_the_epoch.as_millis();
-        let metadata_filename = format!("metadata_{}.db", timestamp);
-        let data_filename = format!("data_{}.db", timestamp);
-        let index_filename = format!("index_{}.db", timestamp);
-        let checksum_filename = format!("checksum_{}.db", timestamp);
-        let bloom_filter_filename = format!("bloom_{}.db", timestamp);
-        SsTableMetadata {
-            base_path,
-            level,
-            id: timestamp,
-            metadata_filename,
-            data_filename,
-            index_filename,
-            checksum_filename,
-            bloom_filter_filename,
-        }
-    }
-    fn construct_path(&self, filename: &str) -> PathBuf {
-        let mut path = PathBuf::from(&self.base_path);
-        path.push(format!("level-{}", self.level));
-        path.push(filename);
-        path
-    }
-
-    pub(crate) fn data_path(&self) -> PathBuf {
-        self.construct_path(&self.data_filename)
-    }
-
-    fn index_path(&self) -> PathBuf {
-        self.construct_path(&self.index_filename)
-    }
-
-    fn checksum_path(&self) -> PathBuf {
-        self.construct_path(&self.checksum_filename)
-    }
-
-    fn metadata_path(&self) -> PathBuf {
-        self.construct_path(&self.metadata_filename)
-    }
-
-    fn bloom_filter_path(&self) -> PathBuf {
-        self.construct_path(&self.bloom_filter_filename)
-    }
-
-    pub fn load(metadata_path: &Path) -> SsTableMetadata {
-        let metadata_file = OpenOptions::new()
-            .read(true)
-            .open(metadata_path)
-            .expect("Can't open metadata file");
-        serde_json::from_reader(metadata_file)
-            .expect("Can't read metadata file, file with unknown format")
-    }
-}
 
 pub struct SsTable<T: Seek + Read> {
     metadata: SsTableMetadata,
@@ -112,7 +40,7 @@ pub struct SsTable<T: Seek + Read> {
     size_bytes: u64,
 }
 
-impl Clone for SsTable<File> {
+impl Clone for SsTable<DataFile> {
     fn clone(&self) -> Self {
         let metadata = self.metadata.clone();
         SsTable::load(&metadata.metadata_path())
@@ -249,8 +177,8 @@ impl<T: Seek + Read> SsTable<T> {
 }
 
 
-impl SsTable<File> {
-    pub fn load(metadata_path: &Path) -> io::Result<SsTable<File>> {
+impl SsTable<DataFile> {
+    pub fn load(metadata_path: &Path) -> io::Result<SsTable<DataFile>> {
         let metadata = SsTableMetadata::load(metadata_path);
         let calculated_data_hash = SsTable::calculate_checksum(&metadata.data_path())?;
         let calculated_index_hash = SsTable::calculate_checksum(&metadata.index_path())?;
@@ -265,9 +193,7 @@ impl SsTable<File> {
         if calculated_index_hash != checksums.index_checksum {
             panic!("Can't load SSTable from {}. Checksum is not correct", &metadata.index_filename);
         }
-        let mut data_file = OpenOptions::new()
-            .read(true)
-            .open(&metadata.data_path())
+        let mut data_file = DataFile::open(&metadata.data_path())
             .expect("Can't create/open data file");
         let index_file = OpenOptions::new()
             .read(true)
@@ -292,7 +218,7 @@ impl SsTable<File> {
         })
     }
 
-    pub fn from_memtable(base_path: &str, memtable: &MemTable) -> io::Result<SsTable<File>> {
+    pub fn from_memtable(base_path: &str, memtable: &MemTable) -> io::Result<SsTable<DataFile>> {
         let metadata = SsTableMetadata::new(base_path.to_string(), 0);
         let (data_file, index, bloom_filter, size) =
             SsTable::write_data_file(&metadata, memtable)?;
@@ -309,7 +235,7 @@ impl SsTable<File> {
         })
     }
 
-    pub fn merge_compact(tables: &mut Vec<SsTable<File>>, level: u8, base_path: &str) -> io::Result<SsTable<File>> {
+    pub fn merge_compact(tables: &mut Vec<SsTable<DataFile>>, level: u8, base_path: &str) -> io::Result<SsTable<DataFile>> {
         let size: u64 = tables.iter().map(|table| table.size_bytes).sum();
         let mut iterators = Vec::with_capacity(tables.len());
         let mut values = Vec::with_capacity(tables.len());
@@ -371,9 +297,7 @@ impl SsTable<File> {
         SsTable::write_metadata(&metadata)?;
         let size = file.seek(SeekFrom::End(0))?;
 
-        let data_file = OpenOptions::new()
-            .read(true)
-            .open(&metadata.data_path())?;
+        let data_file = DataFile::open(&metadata.data_path())?;
 
         Ok(SsTable {
             metadata,
@@ -392,7 +316,7 @@ impl SsTable<File> {
         fs::remove_file(self.metadata.data_path())
     }
 
-    fn write_data_file(metadata: &SsTableMetadata, memtable: &MemTable) -> io::Result<(File, SstableIndex, SstableBloomFilter, u64)> {
+    fn write_data_file(metadata: &SsTableMetadata, memtable: &MemTable) -> io::Result<(DataFile, SstableIndex, SstableBloomFilter, u64)> {
         let mut data_file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -413,9 +337,7 @@ impl SsTable<File> {
         }
         data_file.flush()?;
 
-        let data_file = OpenOptions::new()
-            .read(true)
-            .open(&metadata.data_path())?;
+        let data_file = DataFile::open(&metadata.data_path())?;
         Ok((data_file, index, bloom_filter, pos))
     }
 
@@ -499,9 +421,10 @@ mod tests {
     use std::{env, fs};
     use std::fs::File;
     use serial_test::serial;
+    use crate::datafile::DataFile;
 
     use crate::memtable::MemTable;
-    use crate::sstable::SsTable;
+    use crate::sync::sstable::SsTable;
 
     fn prepare_directories() -> String{
         let mut buf = env::temp_dir();
@@ -568,7 +491,7 @@ mod tests {
         check_values(&mut sstable)
     }
 
-    fn check_values(sstable: &mut SsTable<File>) {
+    fn check_values(sstable: &mut SsTable<DataFile>) {
         for i in 0..500 {
             let val = sstable.get(&i.to_string().into_bytes()).unwrap();
             assert_eq!(true, val.is_some());

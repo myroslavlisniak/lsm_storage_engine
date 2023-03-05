@@ -3,8 +3,8 @@ extern crate config as config_lib;
 extern crate crc;
 extern crate serde_derive;
 
-pub use lsm_storage::LsmStorage;
-pub use db::Db;
+pub use sync::lsm_storage::LsmStorage;
+pub use crate::tokio::db::Db;
 
 pub type ByteString = Vec<u8>;
 pub type ByteStr = [u8];
@@ -12,6 +12,13 @@ pub type ByteStr = [u8];
 pub mod config;
 mod memtable;
 mod wal;
-mod sstable;
-mod lsm_storage;
-mod db;
+mod sync;
+mod tokio;
+mod datafile;
+mod sstable_metadata;
+
+#[derive(Debug)]
+pub struct KeyValuePair {
+    pub key: ByteString,
+    pub value: ByteString,
+}
