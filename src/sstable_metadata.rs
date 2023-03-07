@@ -1,4 +1,5 @@
 use std::fs::OpenOptions;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Serialize, Deserialize};
@@ -73,5 +74,14 @@ impl SsTableMetadata {
             .expect("Can't open metadata file");
         serde_json::from_reader(metadata_file)
             .expect("Can't read metadata file, file with unknown format")
+    }
+
+    pub(crate) fn write_to_file(&self) -> io::Result<()> {
+        let metadata_file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .open(&self.metadata_path())?;
+        serde_json::to_writer(metadata_file, self)
+            .map_err(io::Error::from)
     }
 }

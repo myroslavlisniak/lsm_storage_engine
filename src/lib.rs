@@ -16,6 +16,9 @@ mod sync;
 mod tokio;
 mod datafile;
 mod sstable_metadata;
+mod checksums;
+mod sstable_index;
+mod sstable_bloom_filter;
 
 #[derive(Debug)]
 pub struct KeyValuePair {
