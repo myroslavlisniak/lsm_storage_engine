@@ -5,7 +5,6 @@ use std::cmp::Ordering;
 use std::collections::btree_map::Range;
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use byteorder::{LittleEndian, WriteBytesExt};
 use log::debug;
 use parking_lot::Mutex;
 use probabilistic_collections::bloom::BloomFilter;
@@ -168,7 +167,7 @@ impl SsTable {
         let mut bloom_filter = BloomFilter::<ByteString>::new(memtable.size(), 0.01);
         let mut pos = 0;
         for (i, (key, val)) in memtable.into_iter().enumerate() {
-            let diff = SsTable::write_key_value(&mut data_file, key, val)?;
+            let diff = DataFile::write_key_value(&mut data_file, key, val)?;
             bloom_filter.insert(key);
             if i % INDEX_STEP == 0 {
                 index.insert(key.clone(), pos);
@@ -245,16 +244,6 @@ impl SsTable {
         Ok(base64_encode(hash))
     }
 
-    fn write_key_value(data_file: &mut File, key: &ByteStr, val: &ByteStr) -> io::Result<u64> {
-        let key_len = key.len() as u32;
-        let val_len = val.len() as u32;
-        data_file.write_u32::<LittleEndian>(key_len)?;
-        data_file.write_u32::<LittleEndian>(val_len)?;
-        data_file.write_all(key)?;
-        data_file.write_all(val)?;
-        Ok(u64::from(8 + key_len + val_len))
-    }
-
     pub fn id(&self) -> u128 {
         self.meta.metadata.id
     }
@@ -303,7 +292,7 @@ impl SsTable {
                     if kv.value == vec![0] {
                         continue;
                     }
-                    let diff = Self::write_key_value(&mut file, &kv.key, &kv.value)?;
+                    let diff = DataFile::write_key_value(&mut file, &kv.key, &kv.value)?;
                     if counter % INDEX_STEP == 0 {
                         index.insert(kv.key.clone(), pos);
                     }

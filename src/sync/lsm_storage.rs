@@ -7,7 +7,6 @@ use log::{debug};
 
 use crate::{ByteStr, ByteString};
 use crate::config::Config;
-use crate::datafile::DataFile;
 use crate::memtable::MemTable;
 use crate::sync::sstable::SsTable;
 use crate::wal::CommandLog;
@@ -19,7 +18,7 @@ pub struct LsmStorage {
     config: Config,
     wal: CommandLog<File>,
     memtable: MemTable,
-    sstables: Vec<Vec<SsTable<DataFile>>>,
+    sstables: Vec<Vec<SsTable>>,
 }
 
 impl LsmStorage {
@@ -31,7 +30,7 @@ impl LsmStorage {
             level_path.push(format!("level-{}", i));
             fs::create_dir_all(&level_path)?;
 
-            let mut tables: Vec<SsTable<DataFile>> = Vec::new();
+            let mut tables: Vec<SsTable> = Vec::new();
             let paths = fs::read_dir(level_path)?;
 
             for path in paths {
@@ -64,7 +63,7 @@ impl LsmStorage {
         self.memtable.insert(key, value);
         if self.memtable.size_in_bytes() >= self.config.memtable_limit_bytes {
             debug!("Memtable is too big, creating new sstable");
-            let sstable: SsTable<DataFile> = SsTable::from_memtable(&self.config.base_path, &self.memtable)
+            let sstable: SsTable = SsTable::from_memtable(&self.config.base_path, &self.memtable)
                 .expect("Can't create new sstable");
             self.wal.close().expect("Can't remove old wal log");
             self.sstables[0].push(sstable);

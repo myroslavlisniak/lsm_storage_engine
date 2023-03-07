@@ -3,12 +3,11 @@ extern crate probabilistic_collections;
 use std::{fs, io};
 use std::cmp::Ordering;
 use std::collections::btree_map::{BTreeMap, Range};
-use std::fs::{File, OpenOptions};
+use std::fs::{ OpenOptions};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use base64::encode as base64_encode;
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use log::debug;
 use probabilistic_collections::bloom::BloomFilter;
 use serde::{Deserialize, Serialize};
@@ -32,15 +31,15 @@ struct Checksums {
 
 
 
-pub struct SsTable<T: Seek + Read> {
+pub struct SsTable {
     metadata: SsTableMetadata,
-    data: T,
+    data: DataFile,
     index: SstableIndex,
     bloom_filter: SstableBloomFilter,
     size_bytes: u64,
 }
 
-impl Clone for SsTable<DataFile> {
+impl Clone for SsTable {
     fn clone(&self) -> Self {
         let metadata = self.metadata.clone();
         SsTable::load(&metadata.metadata_path())
@@ -48,21 +47,21 @@ impl Clone for SsTable<DataFile> {
     }
 }
 
-impl<T: Seek + Read> PartialEq<Self> for SsTable<T> {
+impl PartialEq<Self> for SsTable {
     fn eq(&self, other: &Self) -> bool {
         self.id() == other.id()
     }
 }
 
-impl<T: Seek + Read> Eq for SsTable<T> {}
+impl Eq for SsTable {}
 
-impl<T: Seek + Read> PartialOrd for SsTable<T> {
+impl PartialOrd for SsTable {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl<T: Seek + Read> Ord for SsTable<T> {
+impl Ord for SsTable {
     fn cmp(&self, other: &Self) -> Ordering {
         if self.eq(other) { Ordering::Equal } else if self.id() < other.id() {
             Ordering::Less
@@ -72,10 +71,10 @@ impl<T: Seek + Read> Ord for SsTable<T> {
     }
 }
 
-impl<'a, T: Seek + Read> IntoIterator for &'a mut SsTable<T> {
+impl<'a> IntoIterator for &'a mut SsTable {
     type Item = KeyValuePair;
 
-    type IntoIter = Iter<'a, T>;
+    type IntoIter = Iter<'a>;
 
     fn into_iter(self) -> Self::IntoIter {
         Iter {
@@ -85,16 +84,16 @@ impl<'a, T: Seek + Read> IntoIterator for &'a mut SsTable<T> {
     }
 }
 
-pub struct Iter<'a, T: Seek + Read> {
-    table: &'a mut SsTable<T>,
+pub struct Iter<'a> {
+    table: &'a mut SsTable,
     pos: u64,
 }
 
-impl<'a, T: Seek + Read> Iterator for Iter<'a, T> {
+impl<'a> Iterator for Iter<'a> {
     type Item = KeyValuePair;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match self.table.read_record(self.pos) {
+        match self.table.data.read_record(self.pos) {
             Ok(Some((kv_pair, len))) => {
                 self.pos += len;
                 Some(kv_pair)
@@ -105,7 +104,7 @@ impl<'a, T: Seek + Read> Iterator for Iter<'a, T> {
     }
 }
 
-impl<T: Seek + Read> SsTable<T> {
+impl SsTable {
     pub fn id(&self) -> u128 {
         self.metadata.id
     }
@@ -117,12 +116,12 @@ impl<T: Seek + Read> SsTable<T> {
         match self.index.get(key) {
             Some(pos) => {
                 let position = *pos;
-                self.read_record(position)
+                self.data.read_record(position)
                     .map(|op| op.map(|p| p.0.value))
             }
             None => {
                 let (start, end) = self.position_range(key);
-                self.scan_range(key, start, end)
+                self.data.scan_range(key, start, end)
             }
         }
     }
@@ -135,50 +134,11 @@ impl<T: Seek + Read> SsTable<T> {
         (start, end)
     }
 
-    fn scan_range(&mut self, key: &ByteStr, start: u64, end: u64) -> io::Result<Option<ByteString>> {
-        let mut pos = start;
-        while let Some((kv, len)) = self.read_record(pos)? {
-            if kv.key == *key {
-                return Ok(Some(kv.value));
-            } else {
-                pos += len;
-                if pos >= end {
-                    break;
-                }
-            }
-        }
-        Ok(None)
-    }
-
-    fn read_record(&mut self, pos: u64) -> io::Result<Option<(KeyValuePair, u64)>> {
-        match self.read_record_unsafe(pos) {
-            Ok(res) => Ok(Some(res)),
-            Err(err) => match err.kind() {
-                ErrorKind::UnexpectedEof => Ok(None),
-                _ => Err(err)
-            }
-        }
-    }
-
-    fn read_record_unsafe(&mut self, pos: u64) -> io::Result<(KeyValuePair, u64)> {
-        let seek_from = SeekFrom::Start(pos);
-        self.data.seek(seek_from)?;
-        let key_len = self.data.read_u32::<LittleEndian>()?;
-        let val_len = self.data.read_u32::<LittleEndian>()?;
-        let mut key: Vec<u8> = vec![0u8; key_len as usize];
-        let mut val: Vec<u8> = vec![0u8; val_len as usize];
-        self.data.read_exact(&mut key)?;
-        self.data.read_exact(&mut val)?;
-        Ok((KeyValuePair {
-            key,
-            value: val,
-        }, u64::from(8 + key_len + val_len)))
-    }
 }
 
 
-impl SsTable<DataFile> {
-    pub fn load(metadata_path: &Path) -> io::Result<SsTable<DataFile>> {
+impl SsTable {
+    pub fn load(metadata_path: &Path) -> io::Result<SsTable> {
         let metadata = SsTableMetadata::load(metadata_path);
         let calculated_data_hash = SsTable::calculate_checksum(&metadata.data_path())?;
         let calculated_index_hash = SsTable::calculate_checksum(&metadata.index_path())?;
@@ -218,7 +178,7 @@ impl SsTable<DataFile> {
         })
     }
 
-    pub fn from_memtable(base_path: &str, memtable: &MemTable) -> io::Result<SsTable<DataFile>> {
+    pub fn from_memtable(base_path: &str, memtable: &MemTable) -> io::Result<SsTable> {
         let metadata = SsTableMetadata::new(base_path.to_string(), 0);
         let (data_file, index, bloom_filter, size) =
             SsTable::write_data_file(&metadata, memtable)?;
@@ -235,7 +195,7 @@ impl SsTable<DataFile> {
         })
     }
 
-    pub fn merge_compact(tables: &mut Vec<SsTable<DataFile>>, level: u8, base_path: &str) -> io::Result<SsTable<DataFile>> {
+    pub fn merge_compact(tables: &mut Vec<SsTable>, level: u8, base_path: &str) -> io::Result<SsTable> {
         let size: u64 = tables.iter().map(|table| table.size_bytes).sum();
         let mut iterators = Vec::with_capacity(tables.len());
         let mut values = Vec::with_capacity(tables.len());
@@ -279,7 +239,7 @@ impl SsTable<DataFile> {
                     if kv.value == vec![0] {
                         continue;
                     }
-                    let diff = Self::write_key_value(&mut file, &kv.key, &kv.value)?;
+                    let diff = DataFile::write_key_value(&mut file, &kv.key, &kv.value)?;
                     if counter % INDEX_STEP == 0 {
                         index.insert(kv.key.clone(), pos);
                     }
@@ -328,7 +288,7 @@ impl SsTable<DataFile> {
         let mut bloom_filter = BloomFilter::<ByteString>::new(memtable.size(), 0.01);
         let mut pos = 0;
         for (i, (key, val)) in memtable.into_iter().enumerate() {
-            let diff = SsTable::write_key_value(&mut data_file, key, val)?;
+            let diff = DataFile::write_key_value(&mut data_file, key, val)?;
             bloom_filter.insert(key);
             if i % INDEX_STEP == 0 {
                 index.insert(key.clone(), pos);
@@ -341,15 +301,6 @@ impl SsTable<DataFile> {
         Ok((data_file, index, bloom_filter, pos))
     }
 
-    fn write_key_value(data_file: &mut File, key: &ByteStr, val: &ByteStr) -> io::Result<u64> {
-        let key_len = key.len() as u32;
-        let val_len = val.len() as u32;
-        data_file.write_u32::<LittleEndian>(key_len)?;
-        data_file.write_u32::<LittleEndian>(val_len)?;
-        data_file.write_all(key)?;
-        data_file.write_all(val)?;
-        Ok(u64::from(8 + key_len + val_len))
-    }
 
     fn write_checksums(metadata: &SsTableMetadata) -> io::Result<()> {
         let data_base64_hash = SsTable::calculate_checksum(&metadata.data_path())?;
@@ -419,9 +370,7 @@ impl SsTable<DataFile> {
 #[cfg(test)]
 mod tests {
     use std::{env, fs};
-    use std::fs::File;
     use serial_test::serial;
-    use crate::datafile::DataFile;
 
     use crate::memtable::MemTable;
     use crate::sync::sstable::SsTable;
@@ -491,7 +440,7 @@ mod tests {
         check_values(&mut sstable)
     }
 
-    fn check_values(sstable: &mut SsTable<DataFile>) {
+    fn check_values(sstable: &mut SsTable) {
         for i in 0..500 {
             let val = sstable.get(&i.to_string().into_bytes()).unwrap();
             assert_eq!(true, val.is_some());

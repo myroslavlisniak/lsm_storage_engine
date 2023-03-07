@@ -22,3 +22,12 @@ pub struct KeyValuePair {
     pub key: ByteString,
     pub value: ByteString,
 }
+
+impl KeyValuePair {
+    pub fn new(key: ByteString, value: ByteString) -> KeyValuePair {
+        KeyValuePair{
+            key,
+            value
+        }
+    }
+}

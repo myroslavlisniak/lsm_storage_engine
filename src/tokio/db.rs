@@ -266,7 +266,7 @@ mod tests {
             memtable_limit_bytes: 4096,
             sstable_level_limit: 4
         };
-        let mut storage = Db::load(config)?;
+        let storage = Db::load(config)?;
         let db_clone = storage.clone();
         tokio::task::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(10));
