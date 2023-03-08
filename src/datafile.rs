@@ -5,16 +5,66 @@ use std::path::Path;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use crate::{ByteStr, ByteString, KeyValuePair};
 
-pub(crate) struct DataFile {
+pub(crate) struct WriteableDataFile {
+    data: File
+}
+
+pub(crate) struct ReadOnlyDataFile {
     data: File,
 }
 
-impl DataFile {
-    pub(crate) fn open(path: &Path) -> io::Result<DataFile> {
+impl WriteableDataFile {
+    pub(crate) fn open(path: &Path) -> io::Result<WriteableDataFile> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        Ok(WriteableDataFile {
+            data: file
+        })
+    }
+
+    pub(crate) fn write_key_value(&mut self, key: &ByteStr, val: &ByteStr) -> io::Result<u64> {
+        let key_len = key.len() as u32;
+        let val_len = val.len() as u32;
+        self.write_u32::<LittleEndian>(key_len)?;
+        self.write_u32::<LittleEndian>(val_len)?;
+        self.write_all(key)?;
+        self.write_all(val)?;
+        Ok(u64::from(8 + key_len + val_len))
+    }
+
+    pub(crate) fn size(&mut self) -> io::Result<u64> {
+        let size = self.seek(SeekFrom::End(0));
+        self.seek(SeekFrom::Start(0))?;
+        size
+    }
+}
+
+impl Write for WriteableDataFile {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.data.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.data.flush()
+    }
+}
+
+impl Seek for WriteableDataFile {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.data.seek(pos)
+    }
+}
+
+impl ReadOnlyDataFile {
+    pub(crate) fn open(path: &Path) -> io::Result<ReadOnlyDataFile> {
         let file = OpenOptions::new()
             .read(true)
             .open(path)?;
-        Ok(DataFile {
+        Ok(ReadOnlyDataFile {
             data: file,
         })
     }
@@ -56,24 +106,21 @@ impl DataFile {
         Ok(None)
     }
 
-    pub(crate) fn write_key_value(data_file: &mut File, key: &ByteStr, val: &ByteStr) -> io::Result<u64> {
-        let key_len = key.len() as u32;
-        let val_len = val.len() as u32;
-        data_file.write_u32::<LittleEndian>(key_len)?;
-        data_file.write_u32::<LittleEndian>(val_len)?;
-        data_file.write_all(key)?;
-        data_file.write_all(val)?;
-        Ok(u64::from(8 + key_len + val_len))
+    pub(crate) fn size(&mut self) -> io::Result<u64> {
+        let size = self.seek(SeekFrom::End(0));
+        self.seek(SeekFrom::Start(0))?;
+        size
     }
+
 }
 
-impl Read for DataFile {
+impl Read for ReadOnlyDataFile {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.data.read(buf)
     }
 }
 
-impl Seek for DataFile {
+impl Seek for ReadOnlyDataFile {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         self.data.seek(pos)
     }
