@@ -1,21 +1,19 @@
 extern crate probabilistic_collections;
 
-use std::{fs, io};
 use std::cmp::Ordering;
 use std::io::Write;
 use std::path::Path;
+use std::{fs, io};
 
-
-use crate::{ByteStr, KeyValuePair};
 use crate::checksums::Checksums;
-use crate::datafile::{ReadOnlyDataFile, WriteableDataFile};
+use crate::datafile::{ReadOnlyDataFile, SizedFile, WriteableDataFile};
 use crate::memtable::{ByteString, MemTable};
 use crate::sstable_bloom_filter::SstableBloomFilter;
-use crate::sstable_metadata::SsTableMetadata;
 use crate::sstable_index::SstableIndex;
+use crate::sstable_metadata::SsTableMetadata;
+use crate::{ByteStr, KeyValuePair};
 
 const INDEX_STEP: usize = 100;
-
 
 pub struct SsTable {
     metadata: SsTableMetadata,
@@ -28,8 +26,7 @@ pub struct SsTable {
 impl Clone for SsTable {
     fn clone(&self) -> Self {
         let metadata = self.metadata.clone();
-        SsTable::load(&metadata.metadata_path())
-            .expect("Can't load sstable file")
+        SsTable::load(&metadata.metadata_path()).expect("Can't load sstable file")
     }
 }
 
@@ -49,7 +46,9 @@ impl PartialOrd for SsTable {
 
 impl Ord for SsTable {
     fn cmp(&self, other: &Self) -> Ordering {
-        if self.eq(other) { Ordering::Equal } else if self.id() < other.id() {
+        if self.eq(other) {
+            Ordering::Equal
+        } else if self.id() < other.id() {
             Ordering::Less
         } else {
             Ordering::Greater
@@ -83,9 +82,9 @@ impl<'a> Iterator for Iter<'a> {
             Ok(Some((kv_pair, len))) => {
                 self.pos += len;
                 Some(kv_pair)
-            },
+            }
             Ok(None) => None,
-            Err(err) => panic!("Unexpected error occurred. Err: {}", err)
+            Err(err) => panic!("Unexpected error occurred. Err: {}", err),
         }
     }
 }
@@ -99,30 +98,28 @@ impl SsTable {
         if !self.bloom_filter.contains(key) {
             return Ok(None);
         }
-        match self.index.get(key) {
+
+        let res = match self.index.get(key) {
             Some(pos) => {
                 let position = *pos;
-                self.data.read_record(position)
-                    .map(|op| op.map(|p| p.0.value))
+                self.data.read_record(position).map(|op| op.map(|p| p.0))
             }
             None => {
                 let (start, end) = self.index.position_range(key, self.size_bytes);
                 self.data.scan_range(key, start, end)
             }
-        }
+        }?;
+        Ok(res.map(|kv| kv.value_owned()))
     }
-
 }
-
 
 impl SsTable {
     pub fn load(metadata_path: &Path) -> io::Result<SsTable> {
         let metadata = SsTableMetadata::load(metadata_path);
         Checksums::verify(&metadata)?;
-        let mut data_file = ReadOnlyDataFile::open(&metadata.data_path())
-            .expect("Can't create/open data file");
-        let index = SstableIndex::load(&metadata.index_path())
-            .expect("Can't open index file");
+        let mut data_file =
+            ReadOnlyDataFile::open(&metadata.data_path()).expect("Can't create/open data file");
+        let index = SstableIndex::load(&metadata.index_path()).expect("Can't open index file");
         let bloom_filter = SstableBloomFilter::load(&metadata.bloom_filter_path())
             .expect("Cant open bloom filter file");
         let size = data_file.size()?;
@@ -137,8 +134,7 @@ impl SsTable {
 
     pub fn from_memtable(base_path: &str, memtable: &MemTable) -> io::Result<SsTable> {
         let metadata = SsTableMetadata::new(base_path.to_string(), 0);
-        let (data_file, index, bloom_filter, size) =
-            SsTable::write_data_file(&metadata, memtable)?;
+        let (data_file, index, bloom_filter, size) = SsTable::write_data_file(&metadata, memtable)?;
         index.write_to_file(&metadata.index_path())?;
         Checksums::write_checksums(&metadata)?;
         bloom_filter.write_to_file(&metadata.bloom_filter_path())?;
@@ -152,7 +148,11 @@ impl SsTable {
         })
     }
 
-    pub fn merge_compact(tables: &mut Vec<SsTable>, level: u8, base_path: &str) -> io::Result<SsTable> {
+    pub fn merge_compact(
+        tables: &mut Vec<SsTable>,
+        level: u8,
+        base_path: &str,
+    ) -> io::Result<SsTable> {
         let size: u64 = tables.iter().map(|table| table.size_bytes).sum();
         let mut iterators = Vec::with_capacity(tables.len());
         let mut values = Vec::with_capacity(tables.len());
@@ -177,10 +177,10 @@ impl SsTable {
                             current_idx = Some(i);
                         }
                         Some(curr) => {
-                            if kv.key <= values[curr].as_ref().unwrap().key {
+                            if kv.key_ref() <= values[curr].as_ref().unwrap().key_ref() {
                                 current_idx = Some(i);
                             }
-                            if values[curr].as_ref().unwrap().key == kv.key {
+                            if values[curr].as_ref().unwrap().key_ref() == kv.key_ref() {
                                 values[curr] = iterators[curr].next()
                             }
                         }
@@ -190,19 +190,20 @@ impl SsTable {
             match current_idx {
                 Some(idx) => {
                     let kv = values[idx].as_ref().unwrap();
-                    if kv.value == vec![0] {
+                    if kv.value_ref() == vec![0] {
                         continue;
                     }
-                    let diff = file.write_key_value(&kv.key, &kv.value)?;
+                    let diff = file.write_key_value(kv.key_ref(), kv.value_ref())?;
+
+                    bloom_filter.insert(kv.key_ref());
                     if counter % INDEX_STEP == 0 {
-                        index.insert(kv.key.clone(), pos);
+                        index.insert(kv.key_cloned(), pos);
                     }
                     counter += 1;
                     pos += diff;
-                    bloom_filter.insert(&kv.key);
                     values[idx] = iterators[idx].next();
                 }
-                None => break
+                None => break,
             }
         }
         index.write_to_file(&metadata.index_path())?;
@@ -230,7 +231,10 @@ impl SsTable {
         fs::remove_file(self.metadata.data_path())
     }
 
-    fn write_data_file(metadata: &SsTableMetadata, memtable: &MemTable) -> io::Result<(ReadOnlyDataFile, SstableIndex, SstableBloomFilter, u64)> {
+    fn write_data_file(
+        metadata: &SsTableMetadata,
+        memtable: &MemTable,
+    ) -> io::Result<(ReadOnlyDataFile, SstableIndex, SstableBloomFilter, u64)> {
         let mut data_file = WriteableDataFile::open(&metadata.data_path())?;
         let mut index = SstableIndex::new();
         let mut bloom_filter = SstableBloomFilter::new(memtable.size());
@@ -248,8 +252,6 @@ impl SsTable {
         let data_file = ReadOnlyDataFile::open(&metadata.data_path())?;
         Ok((data_file, index, bloom_filter, pos))
     }
-
-
 }
 
 #[cfg(test)]
@@ -261,7 +263,7 @@ mod tests {
     use crate::memtable::MemTable;
     use crate::sync::sstable::SsTable;
 
-    fn prepare_directories() -> String{
+    fn prepare_directories() -> String {
         let mut buf = env::temp_dir();
         buf.push("sstable_test");
         let base_dir = buf.to_str().expect("Can't get temp directory");
@@ -304,10 +306,10 @@ mod tests {
         }
         let mut sstable = SsTable::from_memtable(&base_dir, &memtable).unwrap();
         let mut i = 0;
-        entries.sort_by(|a,b| a.0.cmp(&b.0));
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
         for kv in sstable.into_iter() {
-            assert_eq!(entries[i].0, kv.key);
-            assert_eq!(entries[i].1, kv.value);
+            assert_eq!(entries[i].0, kv.key_ref());
+            assert_eq!(entries[i].1, kv.value_ref());
             i += 1;
         }
     }

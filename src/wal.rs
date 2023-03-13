@@ -1,28 +1,24 @@
-use std::{fs, io};
 use std::convert::TryFrom;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
+use std::{fs, io};
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use crc::crc32;
 use thiserror::Error;
 
-
-use crate::ByteStr;
 use crate::memtable::ByteString;
+use crate::ByteStr;
 
 #[derive(Error, Debug)]
 pub enum WalError {
     #[error("invalid command type: {0}")]
-    InvalidCommandType (u8),
+    InvalidCommandType(u8),
     #[error("data corruption encountered ({checksum:08x}) != {expected:08x}")]
-    CorruptedData {
-        checksum: u32,
-        expected: u32,
-    },
+    CorruptedData { checksum: u32, expected: u32 },
     #[error(transparent)]
-    IoError(#[from] io::Error)
+    IoError(#[from] io::Error),
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -37,18 +33,16 @@ impl TryFrom<u8> for CommandType {
         match value {
             1 => Ok(CommandType::Insert),
             2 => Ok(CommandType::Remove),
-            type_code => Err(WalError::InvalidCommandType(type_code ))
+            type_code => Err(WalError::InvalidCommandType(type_code)),
         }
     }
 }
-
 
 #[derive(PartialEq, Eq, Debug)]
 pub enum LogRecord {
     Remove(ByteString),
     Insert(ByteString, ByteString),
 }
-
 
 pub struct CommandLog<T: Read + Write> {
     file: T,
@@ -79,14 +73,12 @@ impl<T: Read + Write> Iterator for &mut CommandLog<T> {
         match result {
             Ok(record) => Some(Ok(record)),
             Err(wal_err) => match wal_err {
-                WalError::IoError(ref err) =>  match err.kind() {
-                    io::ErrorKind::UnexpectedEof => {
-                        None
-                    }
+                WalError::IoError(ref err) => match err.kind() {
+                    io::ErrorKind::UnexpectedEof => None,
                     _ => Some(Err(wal_err)),
                 },
-                _ => Some(Err(wal_err))
-            }
+                _ => Some(Err(wal_err)),
+            },
         }
     }
 }
@@ -111,7 +103,7 @@ impl CommandLog<File> {
     pub fn close(&self) -> io::Result<()> {
         match &self.path {
             Some(val) => fs::remove_file(val),
-            None => Ok(())
+            None => Ok(()),
         }
     }
 }
@@ -137,13 +129,15 @@ impl<T: Read + Write> CommandLog<T> {
                 let data_len = key_len + val_len;
                 let mut data = ByteString::with_capacity(data_len as usize);
                 {
-                    Read::take(self, data_len as u64)
-                        .read_to_end(&mut data)?;
+                    Read::take(self, data_len as u64).read_to_end(&mut data)?;
                 }
                 debug_assert_eq!(data.len(), data_len as usize);
                 let checksum = crc::crc32::checksum_ieee(&data);
                 if checksum != saved_checksum {
-                    return Err( WalError::CorruptedData {checksum, expected: saved_checksum});
+                    return Err(WalError::CorruptedData {
+                        checksum,
+                        expected: saved_checksum,
+                    });
                 }
                 let val = data.split_off(key_len as usize);
                 let key = data;
@@ -153,13 +147,15 @@ impl<T: Read + Write> CommandLog<T> {
                 let key_len = self.read_u32::<LittleEndian>()?;
                 let mut data = ByteString::with_capacity(key_len as usize);
                 {
-                    Read::take(self, key_len as u64)
-                        .read_to_end(&mut data)?;
+                    Read::take(self, key_len as u64).read_to_end(&mut data)?;
                 }
                 debug_assert_eq!(data.len(), key_len as usize);
                 let checksum = crc::crc32::checksum_ieee(&data);
                 if checksum != saved_checksum {
-                    panic!("data corruption encountered ({:08x}) != {:08x}", checksum, saved_checksum);
+                    panic!(
+                        "data corruption encountered ({:08x}) != {:08x}",
+                        checksum, saved_checksum
+                    );
                 }
                 Ok(LogRecord::Remove(data))
             }
@@ -223,13 +219,17 @@ mod tests {
     #[test]
     fn write_insert_log_record() {
         let mut log = CommandLog::new_in_memory(Vec::new());
-        log.insert("key".as_bytes().to_vec().as_ref(), "value".as_bytes().to_vec().as_ref()).unwrap();
-        let expected_record = LogRecord::Insert("key".as_bytes().to_vec(), "value".as_bytes().to_vec());
+        log.insert(
+            "key".as_bytes().to_vec().as_ref(),
+            "value".as_bytes().to_vec().as_ref(),
+        )
+        .unwrap();
+        let expected_record =
+            LogRecord::Insert("key".as_bytes().to_vec(), "value".as_bytes().to_vec());
         let mut read_log = CommandLog::new_in_memory(log.inner());
         let actual_record = read_log.next_record().unwrap();
         assert_eq!(expected_record, actual_record);
     }
-
 
     #[test]
     fn write_remove_log_record() {
