@@ -44,12 +44,19 @@ impl Checksums {
             .read(true)
             .open(&metadata.checksum_path())
             .expect("Can't open checksum file");
-        let checksums: Checksums = serde_json::from_reader(checksum_file).map_err(io::Error::from)?;
+        let checksums: Checksums =
+            serde_json::from_reader(checksum_file).map_err(io::Error::from)?;
         if calculated_data_hash != checksums.data_checksum {
-            panic!("Can't load SSTable from {}. Checksum is not correct", &metadata.data_filename);
+            panic!(
+                "Can't load SSTable from {}. Checksum is not correct",
+                &metadata.data_filename
+            );
         }
         if calculated_index_hash != checksums.index_checksum {
-            panic!("Can't load SSTable from {}. Checksum is not correct", &metadata.index_filename);
+            panic!(
+                "Can't load SSTable from {}. Checksum is not correct",
+                &metadata.index_filename
+            );
         }
         Ok(())
     }
@@ -57,7 +64,10 @@ impl Checksums {
     pub(crate) fn write_checksums(metadata: &SsTableMetadata) -> io::Result<()> {
         let data_base64_hash = Self::calculate_checksum(&metadata.data_path())?;
         let index_base64_hash = Self::calculate_checksum(&metadata.index_path())?;
-        debug!("Base64-encoded hash: {}, for file: {}", data_base64_hash, &metadata.data_filename);
+        debug!(
+            "Base64-encoded hash: {}, for file: {}",
+            data_base64_hash, &metadata.data_filename
+        );
         let checksums = Checksums {
             index_checksum: index_base64_hash,
             data_checksum: data_base64_hash,
@@ -66,7 +76,6 @@ impl Checksums {
             .write(true)
             .create(true)
             .open(&metadata.checksum_path())?;
-        serde_json::to_writer(checksum_file, &checksums)
-            .map_err(io::Error::from)
+        serde_json::to_writer(checksum_file, &checksums).map_err(io::Error::from)
     }
 }

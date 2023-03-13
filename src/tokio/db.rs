@@ -1,21 +1,20 @@
-use std::{fs, io, mem};
 use std::convert::TryFrom;
 use std::fs::File;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::{fs, io, mem};
 
 use log::{debug, info};
-use parking_lot::RwLock;
 use parking_lot::lock_api::RwLockUpgradableReadGuard;
+use parking_lot::RwLock;
 
-use crate::{ByteStr, ByteString};
 use crate::config::Config;
 use crate::memtable::MemTable;
 use crate::tokio::sstable::SsTable;
 use crate::wal::CommandLog;
+use crate::{ByteStr, ByteString};
 
 const SSTABLE_MAX_LEVEL: usize = 5;
-
 
 #[derive(Clone)]
 pub struct Db {
@@ -33,8 +32,6 @@ struct State {
 struct SsLevelTable {
     levels: Vec<Vec<SsTable>>,
 }
-
-
 
 impl Db {
     pub fn load(config: Config) -> io::Result<Db> {
@@ -62,17 +59,15 @@ impl Db {
         }
         let wal_path = Self::wal_path(&config.base_path);
         let mut command_log = CommandLog::new(wal_path)?;
-        let memtable = MemTable::from_log(&mut command_log)
-            .expect("Can't restore memtable from a log");
+        let memtable =
+            MemTable::from_log(&mut command_log).expect("Can't restore memtable from a log");
         Ok(Db {
             state: Arc::new(State {
                 config,
                 memtable: RwLock::new(memtable),
                 old_memtable: RwLock::new(None),
                 wal: RwLock::new(command_log),
-                levels: RwLock::new(SsLevelTable {
-                    levels,
-                }),
+                levels: RwLock::new(SsLevelTable { levels }),
             }),
         })
     }
@@ -107,8 +102,9 @@ impl Db {
             let state = self.state.clone();
             tokio::task::spawn_blocking(move || {
                 debug!("Memtable is too big, creating new sstable");
-                let sstable: SsTable = SsTable::from_memtable(&state.config.base_path, &old_clone.unwrap())
-                    .expect("Can't create new sstable");
+                let sstable: SsTable =
+                    SsTable::from_memtable(&state.config.base_path, &old_clone.unwrap())
+                        .expect("Can't create new sstable");
                 {
                     let mut levels = state.levels.write();
                     levels.levels[0].push(sstable);
@@ -154,7 +150,7 @@ impl Db {
                     Ok(Some(val))
                 }
             }
-            res => res
+            res => res,
         }
     }
     async fn get_internal(&self, key: &ByteStr) -> io::Result<Option<ByteString>> {
@@ -177,7 +173,7 @@ impl Db {
         }
         let state = self.state.clone();
         let key = key.to_owned();
-        let result = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let levels = state.levels.read();
             for i in 0..SSTABLE_MAX_LEVEL {
                 for sstable in levels.levels[i].iter().rev() {
@@ -188,11 +184,8 @@ impl Db {
                 }
             }
             Ok(None)
-        }).await?;
-
-
-        // debug!("Key: {:?} is not found", key);
-        result
+        })
+        .await?
     }
 
     pub async fn compact(&self) -> io::Result<()> {
@@ -208,7 +201,11 @@ impl Db {
                 for i in 0..SSTABLE_MAX_LEVEL - 1 {
                     if levels.levels[i].len() >= db.state.config.sstable_level_limit {
                         info!("Compaction on level {}", i);
-                        let new_sstable = SsTable::merge_compact(&levels.levels[i], u8::try_from(i + 1).unwrap(), &db.state.config.base_path)?;
+                        let new_sstable = SsTable::merge_compact(
+                            &levels.levels[i],
+                            u8::try_from(i + 1).unwrap(),
+                            &db.state.config.base_path,
+                        )?;
                         new_levels[i + 1].push(new_sstable);
                         // FIXME
                         for table in &levels.levels[i] {
@@ -222,30 +219,26 @@ impl Db {
                     }
                 }
                 let mut levels = RwLockUpgradableReadGuard::upgrade(levels);
-                *levels = SsLevelTable {
-                    levels: new_levels
-                };
+                *levels = SsLevelTable { levels: new_levels };
             }
             info!("Compaction finished");
             Ok(())
-        }).await?
-
+        })
+        .await?
     }
-
 }
-
 
 #[cfg(test)]
 mod tests {
-    use std::{env, fs, io};
     use std::collections::HashMap;
+    use std::{env, fs, io};
 
     use rand::Rng;
 
     use crate::config::Config;
     use crate::tokio::db::Db;
 
-    fn prepare_directories() -> String{
+    fn prepare_directories() -> String {
         let mut buf = env::temp_dir();
         buf.push("storage_test");
         let base_dir = buf.to_str().expect("Can't get temp directory");
@@ -254,7 +247,7 @@ mod tests {
         base_dir.to_string()
     }
 
-    #[tokio::test(flavor ="multi_thread", worker_threads = 8)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     // #[serial]
     async fn storage_compact_test() -> io::Result<()> {
         let mut rng = rand::thread_rng();
@@ -264,7 +257,7 @@ mod tests {
         let config = Config {
             base_path: base_dir.to_string(),
             memtable_limit_bytes: 4096,
-            sstable_level_limit: 4
+            sstable_level_limit: 4,
         };
         let storage = Db::load(config)?;
         let db_clone = storage.clone();

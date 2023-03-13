@@ -1,6 +1,6 @@
+use crate::ByteStr;
 use std::collections::{btree_map, BTreeMap};
 use std::io::{Read, Write};
-use crate::ByteStr;
 
 use crate::wal::{CommandLog, LogRecord, WalError};
 
@@ -43,13 +43,8 @@ impl MemTable {
                 }
             }
         }
-        Ok(MemTable {
-            data,
-            bytes: size,
-        })
+        Ok(MemTable { data, bytes: size })
     }
-
-
 }
 
 impl IntoIterator for MemTable {
@@ -97,7 +92,6 @@ impl MemTable {
     pub fn size_in_bytes(&self) -> usize {
         self.bytes
     }
-
 }
 
 #[cfg(test)]
@@ -133,7 +127,10 @@ mod tests {
         let mut log = CommandLog::new_in_memory(vec);
 
         let table = MemTable::from_log(&mut log).unwrap();
-        assert_eq!(table.get("key1".as_bytes().to_vec().as_ref()), Some("value1".as_bytes().to_vec().as_ref()));
+        assert_eq!(
+            table.get("key1".as_bytes().to_vec().as_ref()),
+            Some("value1".as_bytes().to_vec().as_ref())
+        );
     }
 
     #[test]

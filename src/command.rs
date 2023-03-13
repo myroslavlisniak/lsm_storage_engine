@@ -9,7 +9,7 @@ pub enum Response {
     Found(Vec<u8>),
     Ok,
     NotFound(Vec<u8>),
-    NotSupported
+    NotSupported,
 }
 
 impl Command {
@@ -20,10 +20,16 @@ impl Command {
         } else {
             match args[0] {
                 "get" => Command::Get(String::from(args[1]).into_bytes()),
-                "insert" => Command::Insert(String::from(args[1]).into_bytes(), String::from(args[2]).into_bytes()),
-                "update" => Command::Update(String::from(args[1]).into_bytes(), String::from(args[2]).into_bytes()),
+                "insert" => Command::Insert(
+                    String::from(args[1]).into_bytes(),
+                    String::from(args[2]).into_bytes(),
+                ),
+                "update" => Command::Update(
+                    String::from(args[1]).into_bytes(),
+                    String::from(args[2]).into_bytes(),
+                ),
                 "delete" => Command::Delete(String::from(args[1]).into_bytes()),
-                _ => Command::NotSupported
+                _ => Command::NotSupported,
             }
         }
     }

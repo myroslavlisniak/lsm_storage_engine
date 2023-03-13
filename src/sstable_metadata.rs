@@ -1,8 +1,8 @@
+use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-use serde::{Serialize, Deserialize};
 
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct SsTableMetadata {
@@ -81,7 +81,6 @@ impl SsTableMetadata {
             .write(true)
             .create(true)
             .open(&self.metadata_path())?;
-        serde_json::to_writer(metadata_file, self)
-            .map_err(io::Error::from)
+        serde_json::to_writer(metadata_file, self).map_err(io::Error::from)
     }
 }

@@ -9,10 +9,7 @@ pub struct KeyValuePair {
 
 impl KeyValuePair {
     pub fn new(key: ByteString, value: ByteString) -> KeyValuePair {
-        KeyValuePair{
-            key,
-            value
-        }
+        KeyValuePair { key, value }
     }
 
     pub fn key_ref(&self) -> &ByteStr {
@@ -25,7 +22,6 @@ impl KeyValuePair {
     pub fn key_owned(self) -> ByteString {
         self.key
     }
-
 
     pub fn key_cloned(&self) -> ByteString {
         self.key.clone()

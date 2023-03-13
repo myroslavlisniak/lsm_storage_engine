@@ -1,5 +1,5 @@
-extern crate storage_engine;
 extern crate log4rs;
+extern crate storage_engine;
 
 // use std::net::Shutdown;
 
@@ -22,12 +22,10 @@ async fn handle_client(stream: TcpStream, db: Db) {
             let cmd = Command::parse(&data);
 
             let result = match cmd {
-                Command::Get(key) => {
-                    match db.get(&key).await.unwrap() {
-                        None => Response::NotFound(key),
-                        Some(value) => Response::Found(value),
-                    }
-                }
+                Command::Get(key) => match db.get(&key).await.unwrap() {
+                    None => Response::NotFound(key),
+                    Some(value) => Response::Found(value),
+                },
                 Command::Delete(key) => {
                     db.delete(&key).await.unwrap();
                     Response::Ok
@@ -44,16 +42,42 @@ async fn handle_client(stream: TcpStream, db: Db) {
             };
             match result {
                 Response::Ok => stream.write_all("ok\n".as_bytes()).await,
-                Response::Found(v) => stream.write_all(format!("{}\n", String::from_utf8_lossy(&v)).as_bytes()).await,
-                Response::NotFound(key) => stream.write_all(format!("{} not found\n", String::from_utf8_lossy(&key)).as_bytes()).await,
-                Response::NotSupported => stream.write_all(format!("{}\n", "Supported commands: get, insert, update, delete").as_bytes()).await
-            }.unwrap_or_else(|e| error!("Error occurred {}", e));
+                Response::Found(v) => {
+                    stream
+                        .write_all(format!("{}\n", String::from_utf8_lossy(&v)).as_bytes())
+                        .await
+                }
+                Response::NotFound(key) => {
+                    stream
+                        .write_all(
+                            format!("{} not found\n", String::from_utf8_lossy(&key)).as_bytes(),
+                        )
+                        .await
+                }
+                Response::NotSupported => {
+                    stream
+                        .write_all(
+                            format!("{}\n", "Supported commands: get, insert, update, delete")
+                                .as_bytes(),
+                        )
+                        .await
+                }
+            }
+            .unwrap_or_else(|e| error!("Error occurred {}", e));
             data.clear();
             true
         }
         Err(err) => {
-            println!("An error occurred, terminating connection with {}, {}", stream.get_ref().peer_addr().unwrap(), err);
-            stream.get_mut().shutdown().await.expect("Can't terminate server");
+            println!(
+                "An error occurred, terminating connection with {}, {}",
+                stream.get_ref().peer_addr().unwrap(),
+                err
+            );
+            stream
+                .get_mut()
+                .shutdown()
+                .await
+                .expect("Can't terminate server");
             false
         }
     } {}
