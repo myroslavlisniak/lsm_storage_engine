@@ -8,7 +8,7 @@ use parking_lot::Mutex;
 
 use crate::{ByteStr, ByteString, KeyValuePair};
 use crate::checksums::Checksums;
-use crate::datafile::{ReadOnlyDataFile, WriteableDataFile};
+use crate::datafile::{ReadOnlyDataFile, SizedFile, WriteableDataFile};
 use crate::memtable::MemTable;
 use crate::sstable_bloom_filter::SstableBloomFilter;
 use crate::sstable_index::SstableIndex;
@@ -57,6 +57,7 @@ impl SsTable {
             data: Mutex::new(queue),
         })
     }
+
     pub fn get(&self, key: &ByteStr) -> io::Result<Option<ByteString>> {
         if !self.meta.bloom_filter.contains(key) {
             return Ok(None);
@@ -72,17 +73,17 @@ impl SsTable {
             Some(pos) => {
                 let position = *pos;
                 data.read_record(position)
-                    .map(|op| op.map(|p| p.0.value))
+                    .map(|op| op.map(|p| p.0))
             }
             None => {
                 let (start, end) = self.meta.index.position_range(key, self.meta.size_bytes);
-                data.scan_range(key, start, end)
+                Ok(data.scan_range(key, start, end)?.map(|p| p.to_owned()))
             }
-        };
+        }?;
         {
             self.data.lock().push_back(data);
         }
-        result
+        Ok(result.map(|kv| kv.value_owned()))
     }
 
 
@@ -161,10 +162,10 @@ impl SsTable {
                             current_idx = Some(i);
                         }
                         Some(curr) => {
-                            if kv.key <= values[curr].as_ref().unwrap().key {
+                            if kv.key_ref() <= values[curr].as_ref().unwrap().key_ref() {
                                 current_idx = Some(i);
                             }
-                            if values[curr].as_ref().unwrap().key == kv.key {
+                            if values[curr].as_ref().unwrap().key_ref() == kv.key_ref() {
                                 values[curr] = iterators[curr].next()
                             }
                         }
@@ -174,16 +175,16 @@ impl SsTable {
             match current_idx {
                 Some(idx) => {
                     let kv = values[idx].as_ref().unwrap();
-                    if kv.value == vec![0] {
+                    if kv.value_ref() == vec![0] {
                         continue;
                     }
-                    let diff = file.write_key_value(&kv.key, &kv.value)?;
+                    let diff = file.write_key_value(kv.key_ref(), kv.value_ref())?;
                     if counter % INDEX_STEP == 0 {
-                        index.insert(kv.key.clone(), pos);
+                        index.insert(kv.key_cloned(), pos);
                     }
                     counter += 1;
                     pos += diff;
-                    bloom_filter.insert(&kv.key);
+                    bloom_filter.insert(kv.key_ref());
                     values[idx] = iterators[idx].next();
                 }
                 None => break

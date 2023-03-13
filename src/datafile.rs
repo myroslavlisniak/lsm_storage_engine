@@ -3,7 +3,7 @@ use std::io;
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use crate::{ByteStr, ByteString, KeyValuePair};
+use crate::{ByteStr, KeyValuePair};
 
 pub(crate) struct WriteableDataFile {
     data: File
@@ -36,11 +36,6 @@ impl WriteableDataFile {
         Ok(u64::from(8 + key_len + val_len))
     }
 
-    pub(crate) fn size(&mut self) -> io::Result<u64> {
-        let size = self.seek(SeekFrom::End(0));
-        self.seek(SeekFrom::Start(0))?;
-        size
-    }
 }
 
 impl Write for WriteableDataFile {
@@ -91,11 +86,11 @@ impl ReadOnlyDataFile {
         Ok((KeyValuePair::new(key, val), u64::from(8 + key_len + val_len)))
     }
 
-    pub(crate) fn scan_range(&mut self, key: &ByteStr, start: u64, end: u64) -> io::Result<Option<ByteString>> {
+    pub(crate) fn scan_range(&mut self, key: &ByteStr, start: u64, end: u64) -> io::Result<Option<KeyValuePair>> {
         let mut pos = start;
         while let Some((kv, len)) = self.read_record(pos)? {
-            if kv.key == *key {
-                return Ok(Some(kv.value));
+            if kv.key_ref() == key {
+                return Ok(Some(kv));
             } else {
                 pos += len;
                 if pos >= end {
@@ -104,12 +99,6 @@ impl ReadOnlyDataFile {
             }
         }
         Ok(None)
-    }
-
-    pub(crate) fn size(&mut self) -> io::Result<u64> {
-        let size = self.seek(SeekFrom::End(0));
-        self.seek(SeekFrom::Start(0))?;
-        size
     }
 
 }
@@ -123,5 +112,17 @@ impl Read for ReadOnlyDataFile {
 impl Seek for ReadOnlyDataFile {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         self.data.seek(pos)
+    }
+}
+
+pub(crate) trait SizedFile {
+    fn size(&mut self) -> io::Result<u64>;
+}
+
+impl<T> SizedFile for T where T: Seek {
+    fn size(&mut self) -> io::Result<u64> {
+        let size = self.seek(SeekFrom::End(0));
+        self.seek(SeekFrom::Start(0))?;
+        size
     }
 }

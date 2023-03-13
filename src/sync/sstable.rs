@@ -8,7 +8,7 @@ use std::path::Path;
 
 use crate::{ByteStr, KeyValuePair};
 use crate::checksums::Checksums;
-use crate::datafile::{ReadOnlyDataFile, WriteableDataFile};
+use crate::datafile::{ReadOnlyDataFile, SizedFile, WriteableDataFile};
 use crate::memtable::{ByteString, MemTable};
 use crate::sstable_bloom_filter::SstableBloomFilter;
 use crate::sstable_metadata::SsTableMetadata;
@@ -99,17 +99,19 @@ impl SsTable {
         if !self.bloom_filter.contains(key) {
             return Ok(None);
         }
-        match self.index.get(key) {
+
+        let res = match self.index.get(key) {
             Some(pos) => {
                 let position = *pos;
                 self.data.read_record(position)
-                    .map(|op| op.map(|p| p.0.value))
+                    .map(|op| op.map(|p| p.0))
             }
             None => {
                 let (start, end) = self.index.position_range(key, self.size_bytes);
                 self.data.scan_range(key, start, end)
             }
-        }
+        }?;
+        Ok(res.map(|kv| kv.value_owned()))
     }
 
 }
@@ -177,10 +179,10 @@ impl SsTable {
                             current_idx = Some(i);
                         }
                         Some(curr) => {
-                            if kv.key <= values[curr].as_ref().unwrap().key {
+                            if kv.key_ref() <= values[curr].as_ref().unwrap().key_ref() {
                                 current_idx = Some(i);
                             }
-                            if values[curr].as_ref().unwrap().key == kv.key {
+                            if values[curr].as_ref().unwrap().key_ref() == kv.key_ref() {
                                 values[curr] = iterators[curr].next()
                             }
                         }
@@ -190,16 +192,17 @@ impl SsTable {
             match current_idx {
                 Some(idx) => {
                     let kv = values[idx].as_ref().unwrap();
-                    if kv.value == vec![0] {
+                    if kv.value_ref() == vec![0] {
                         continue;
                     }
-                    let diff = file.write_key_value(&kv.key, &kv.value)?;
+                    let diff = file.write_key_value(kv.key_ref(), kv.value_ref())?;
+
+                    bloom_filter.insert(kv.key_ref());
                     if counter % INDEX_STEP == 0 {
-                        index.insert(kv.key.clone(), pos);
+                        index.insert(kv.key_cloned(), pos);
                     }
                     counter += 1;
                     pos += diff;
-                    bloom_filter.insert(&kv.key);
                     values[idx] = iterators[idx].next();
                 }
                 None => break
@@ -306,8 +309,8 @@ mod tests {
         let mut i = 0;
         entries.sort_by(|a,b| a.0.cmp(&b.0));
         for kv in sstable.into_iter() {
-            assert_eq!(entries[i].0, kv.key);
-            assert_eq!(entries[i].1, kv.value);
+            assert_eq!(entries[i].0, kv.key_ref());
+            assert_eq!(entries[i].1, kv.value_ref());
             i += 1;
         }
     }
